@@ -21,6 +21,11 @@ static void halt_system(void);
 // this no-op prevents an undefined symbol error.
 __attribute__((weak)) void restore_termios(void) {}
 
+// Standalone iSH owns the host process and must terminate it when PID 1
+// exits. Embedders override this hook so halt_system can unwind only the
+// joinable kernel pthread instead of terminating the containing app.
+__attribute__((weak)) int ish_embed_soft_halt_enabled(void) { return 0; }
+
 static bool exit_tgroup(struct task *task) {
     struct tgroup *group = task->group;
     list_remove(&task->group_links);
@@ -438,11 +443,11 @@ static void halt_system(void) {
     extern void dump_pc_hist(void);
     dump_pc_hist();
 
-    // Force exit the entire host process. Orphaned guest threads
-    // (stuck in JIT loops after do_exit_group force cleanup) keep
-    // the host process alive indefinitely. _exit is safe here since
-    // init dying means we're shutting down completely.
-    _exit(0);
+    // Standalone iSH owns the entire host process. Embedded iSH instead
+    // returns to do_exit(), which invokes exit_hook and exits only the
+    // joinable PID 1 pthread; the embedding host then joins that thread.
+    if (!ish_embed_soft_halt_enabled())
+        _exit(0);
 }
 
 dword_t sys_exit(dword_t status) {

@@ -204,8 +204,12 @@ __attribute__((constructor)) static void create_attr() {
 }
 
 void task_start(struct task *task) {
-    if (pthread_create(&task->thread, &task_thread_attr, task_thread, task) < 0)
+    if (pthread_create(&task->thread, &task_thread_attr, task_thread, task) != 0)
         die("could not create thread");
+}
+
+int task_start_joinable(struct task *task) {
+    return pthread_create(&task->thread, NULL, task_thread, task);
 }
 
 int_t sys_sched_yield() {

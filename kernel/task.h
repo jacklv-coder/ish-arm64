@@ -217,6 +217,10 @@ struct task *pid_get_task_zombie(dword_t id); // don't return null if the task e
 
 // TODO document
 void task_start(struct task *task);
+// Start a task on a joinable host pthread and return the pthread_create
+// status. Embedders use this for PID 1 so the owning host can prove the
+// kernel thread has stopped before releasing embedding state.
+int task_start_joinable(struct task *task);
 void task_run_current(void);
 
 extern void (*exit_hook)(struct task *task, int code);
