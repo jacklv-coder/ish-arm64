@@ -6,7 +6,9 @@
 #include "util/signpost.h"
 #include <termios.h>
 #include <unistd.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
+#endif
 #include <pthread.h>
 #include "kernel/calls.h"
 #include "kernel/task.h"
@@ -36,7 +38,10 @@ extern void jit_crash_trampoline(void);
 #define CRASH_LOCAL_jit_exit_sp 920
 
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
-#if defined(__aarch64__) && defined(GUEST_ARM64)
+#if !(defined(__APPLE__) && defined(__aarch64__))
+    (void) ctx;
+#endif
+#if defined(__APPLE__) && defined(__aarch64__) && defined(GUEST_ARM64)
     // If we're inside JIT code and got SIGSEGV/SIGBUS, recover by redirecting
     // execution to jit_crash_trampoline via ucontext PC manipulation.
     // This avoids the overhead of _setjmp on every block entry.
@@ -91,10 +96,10 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     // Non-JIT crash: dump state and exit
     char buf[512];
     int len;
-    ucontext_t *uc = (ucontext_t *)ctx;
     len = snprintf(buf, sizeof(buf), "\n=== HOST CRASH: signal %d ===\nfault addr: %p\n", sig, info->si_addr);
     write(STDERR_FILENO, buf, len);
-#ifdef __aarch64__
+#if defined(__APPLE__) && defined(__aarch64__)
+    ucontext_t *uc = (ucontext_t *)ctx;
     len = snprintf(buf, sizeof(buf),
         "pc:  0x%llx\nlr:  0x%llx\nsp:  0x%llx\n"
         "x0:  0x%llx\nx1:  0x%llx\nx2:  0x%llx\n"

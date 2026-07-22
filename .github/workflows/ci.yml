@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [master, embed-chroot-containment]
   pull_request:
-      branches: [master, embed-chroot-containment]
+    branches: [master, embed-chroot-containment]
 
 jobs:
   build-linux:
