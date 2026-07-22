@@ -185,3 +185,6 @@ ssize_t linux_write_file(const char *path, const char *buf, size_t size) {
 int linux_remove_directory(const char *path) {
     return init_rmdir(path);
 }
+int linux_make_directory(const char *path, unsigned int mode) {
+    return init_mkdir(path, mode);
+}
