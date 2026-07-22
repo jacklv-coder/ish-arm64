@@ -38,7 +38,11 @@ jobs:
       - name: Test
         if: matrix.kernel == 'ish'
         timeout-minutes: 10
-        run: meson test -C build --no-rebuild --print-errorlogs --timeout-multiplier 3
+        run: meson test -C build --no-rebuild --print-errorlogs dirty-page-trace float80
+      - name: End-to-end test
+        if: matrix.kernel == 'ish'
+        timeout-minutes: 20
+        run: meson test -C build --no-rebuild --print-errorlogs --timeout-multiplier 6 e2e
 
   build-mac:
     runs-on: macos-15
