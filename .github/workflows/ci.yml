@@ -3,11 +3,11 @@ name: CI
 on:
   push:
   pull_request:
-      branches: [master]
+      branches: [master, embed-chroot-containment]
 
 jobs:
   build-linux:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         cc: [clang, gcc]
@@ -55,6 +55,12 @@ jobs:
       - name: Build
         if: matrix.kernel == 'ish'
         run: xcodebuild -project iSH.xcodeproj -scheme iSH -arch arm64 -sdk iphoneos CODE_SIGNING_ALLOWED=NO
+      - name: Test ARM64 dirty-page chaining
+        if: matrix.kernel == 'ish'
+        run: |
+          meson setup build-arm64-ci -Dguest_arch=arm64 -Dkernel=ish -Dengine=asbestos
+          meson compile -C build-arm64-ci dirty-page-chain-test
+          meson test -C build-arm64-ci --no-rebuild --print-errorlogs dirty-page-chain
       - name: Build
         if: matrix.kernel == 'linux'
         run: xcodebuild -project iSH.xcodeproj -scheme iSH+Linux -arch x86_64 -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO

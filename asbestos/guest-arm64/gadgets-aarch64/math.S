@@ -40,6 +40,21 @@
 1:  add _pc, _pc, #8
     gret
 
+// Publish the page named by IC IVAU, Xt into the executing TLB's dirty set.
+// Code stream: [gadget addr][Rt]
+.gadget ic_ivau
+    ldr x8, [_pc], #8
+    and x8, x8, #0x1f
+    cmp x8, #31
+    b.eq 1f
+    add x9, _cpu, #CPU_x0
+    ldr x8, [x9, x8, lsl #3]
+    b 2f
+1:  mov x8, #0             // XZR
+2:  and x8, x8, #0xfffffffffffff000
+    mark_dirty_page x8
+    gret
+
 // Store _addr (x7) to guest register - used for writeback in pre/post-indexed addressing
 .gadget store_addr_to_reg
     ldr x8, [_pc]
@@ -3689,15 +3704,14 @@ msub_store:
     b .Lmrs_store
 
 .Lmrs_ctr_el0:
-    // Cache Type Register - return typical ARM64 values
+    // Cache Type Register. DIC/IDC are clear, requiring guest DC + IC
+    // maintenance for self-modifying code.
     // IminLine = 4 (2^4 = 16 words = 64 bytes)
     // DminLine = 4 (same)
-    // L1Ip = 3 (PIPT)
     // ERG = 4 (64 bytes)
     // CWG = 4 (64 bytes)
-    // Format: L1Ip[31:28]=3, ERG[27:24]=4, CWG[23:20]=4, DminLine[19:16]=4, IminLine[3:0]=4
-    movz x10, #0x8444, lsl #16
-    movk x10, #0x8004
+    movz x10, #((ARM64_CTR_EL0_VALUE >> 16) & 0xffff), lsl #16
+    movk x10, #(ARM64_CTR_EL0_VALUE & 0xffff)
     b .Lmrs_store
 
 .Lmrs_dczid_el0:

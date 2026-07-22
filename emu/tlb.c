@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "emu/cpu.h"
 #include "emu/tlb.h"
 #include "kernel/task.h"
@@ -5,9 +7,85 @@
 #include "kernel/fs.h"
 #include "util/sync.h"
 
+#if defined(GUEST_X86)
+bool tlb_dirty_trace_attach(struct tlb *tlb) {
+    if (tlb->dirty_trace == NULL)
+        tlb->dirty_trace = calloc(1, sizeof(*tlb->dirty_trace));
+    else
+        tlb_dirty_trace_clear(tlb);
+    return tlb->dirty_trace != NULL;
+}
+
+void tlb_dirty_trace_detach(struct tlb *tlb) {
+    free(tlb->dirty_trace);
+    tlb->dirty_trace = NULL;
+}
+
+void tlb_dirty_trace_clear(struct tlb *tlb) {
+    if (tlb->dirty_trace != NULL)
+        memset(tlb->dirty_trace, 0, sizeof(*tlb->dirty_trace));
+}
+
+bool tlb_dirty_trace_has_pages(const struct tlb *tlb) {
+    if (tlb->dirty_trace == NULL)
+        return false;
+    for (size_t word = 0; word < TLB_DIRTY_TRACE_SUMMARY_WORDS; word++) {
+        if (tlb->dirty_trace->summary_bits[word] != 0)
+            return true;
+    }
+    return false;
+}
+
+bool tlb_dirty_trace_next(const struct tlb *tlb, page_t *cursor,
+        addr_t *page_addr) {
+    if (tlb->dirty_trace == NULL || *cursor >= MEM_PAGES)
+        return false;
+
+    size_t page_word = *cursor / 64;
+    unsigned first_page_bit = *cursor % 64;
+    while (page_word < TLB_DIRTY_TRACE_PAGE_WORDS) {
+        size_t summary_word = page_word / 64;
+        unsigned first_summary_bit = page_word % 64;
+        uint64_t summary = tlb->dirty_trace->summary_bits[summary_word] &
+                (UINT64_MAX << first_summary_bit);
+        if (summary == 0) {
+            page_word = (summary_word + 1) * 64;
+            first_page_bit = 0;
+            continue;
+        }
+
+        size_t found_word = summary_word * 64 +
+                (size_t) __builtin_ctzll(summary);
+        uint64_t pages = tlb->dirty_trace->page_bits[found_word];
+        if (found_word == page_word)
+            pages &= UINT64_MAX << first_page_bit;
+        if (pages == 0) {
+            page_word = found_word + 1;
+            first_page_bit = 0;
+            continue;
+        }
+
+        page_t page = (page_t) (found_word * 64 +
+                (size_t) __builtin_ctzll(pages));
+        *page_addr = (addr_t) page << PAGE_BITS;
+        *cursor = page + 1;
+        return true;
+    }
+    return false;
+}
+#endif
+
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
-    if (tlb->mmu == mmu && tlb->mem_changes == mmu->changes)
+    tlb->compile_nofault_reads = false;
+    uint64_t changes = __atomic_load_n(&mmu->changes, __ATOMIC_ACQUIRE);
+    if (tlb->mmu == mmu && tlb->mem_changes == changes)
         return;
+#if defined(GUEST_X86)
+    // Exact dirty pages name mappings in the current MMU generation. Once the
+    // address space changes, retaining them could compare an unmapped page or
+    // an unrelated replacement mapping in a differential tracer.
+    tlb_dirty_trace_clear(tlb);
+#endif
     if (tlb->mmu != mmu) {
         // Address space changed (execve); block cache and ret_cache are invalid
         memset(tlb->block_cache, 0, sizeof(tlb->block_cache));
@@ -18,13 +96,20 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
         }
     }
     tlb->mmu = mmu;
-    tlb->dirty_page = TLB_PAGE_EMPTY;
-    tlb->mem_changes = mmu->changes;
+    tlb_clear_runtime_dirty_pages(tlb);
     tlb_flush(tlb);
 }
 
 void tlb_flush(struct tlb *tlb) {
-    tlb->mem_changes = tlb->mmu->changes;
+    uint64_t changes = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
+#if defined(GUEST_X86)
+    // Some mapping-change paths flush directly and then make the next
+    // tlb_refresh look current. Clear exact identities before publishing that
+    // new generation, while preserving traces for same-generation cache flushes.
+    if (tlb->mem_changes != changes)
+        tlb_dirty_trace_clear(tlb);
+#endif
+    tlb->mem_changes = changes;
     for (unsigned i = 0; i < TLB_SIZE; i++)
         tlb->entries[i] = (struct tlb_entry) {.page = 1, .page_if_writable = 1};
 }
@@ -32,6 +117,9 @@ void tlb_flush(struct tlb *tlb) {
 void tlb_free(struct tlb *tlb) {
     if (tlb->frame != NULL)
         free(tlb->frame);
+#if defined(GUEST_X86)
+    tlb_dirty_trace_detach(tlb);
+#endif
     free(tlb);
 }
 
@@ -65,7 +153,8 @@ bool __tlb_write_cross_page(struct tlb *tlb, addr_t addr, const char *value, uns
 
 __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
     char *ptr = mmu_translate(tlb->mmu, TLB_PAGE(addr), type);
-    if (tlb->mmu->changes != tlb->mem_changes) {
+    if (__atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE) !=
+            tlb->mem_changes) {
         tlb_flush(tlb);
         // Re-translate after flush. The ptr we got may be stale if another
         // thread did mmap/munmap concurrently. When a multi-page data object
@@ -84,7 +173,8 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, addr_t addr, int type) {
     // mismatch will be detected and the TLB will be flushed.
     tlb->mem_changes = __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE);
 
-    tlb->dirty_page = TLB_PAGE(addr);
+    if (type == MEM_WRITE)
+        tlb_mark_dirty_page(tlb, addr);
 
     struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
     tlb_ent->page = TLB_PAGE(addr);

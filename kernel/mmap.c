@@ -348,9 +348,14 @@ dword_t sys_madvise(addr_t addr, dword_t len, dword_t advice) {
             }
 #endif
             void *ptr = mem_ptr(current->mem, p, MEM_WRITE);
-            read_wrunlock(&current->mem->lock);
-            if (ptr != NULL)
+            if (ptr != NULL) {
                 memset(ptr, 0, PAGE_SIZE);
+                mem_did_write(current->mem, p, PAGE_SIZE);
+            }
+            // Keep the mapping stable through memset and post-write
+            // invalidation; releasing this lock while retaining ptr lets a
+            // concurrent unmap leave a dangling host pointer.
+            read_wrunlock(&current->mem->lock);
         }
     }
     return 0;

@@ -24,6 +24,8 @@ NAME(fiber_enter):
 fiber_ret_chain:
     btq $63, %_ip
     jc fiber_ret
+    cmpl $TLB_PAGE_EMPTY, -TLB_entries+TLB_dirty_page(%_tlb)
+    jne poke
     mov CPU_poked_ptr(%_cpu), %r10
     cmpb $0, (%r10)
     jnz poke

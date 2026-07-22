@@ -117,23 +117,28 @@ static int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, int pid, int und
         }
     }
 
-    // compare pages marked dirty
-    if (tlb->dirty_page != TLB_PAGE_EMPTY) {
+    // Compare every exact page retained by the opt-in diagnostic trace. The
+    // runtime JIT invalidation set has already been drained by the dispatcher.
+    if (tlb_dirty_trace_has_pages(tlb)) {
         int fd = open_mem(pid);
-        page_t dirty_page = tlb->dirty_page;
-        char real_page[PAGE_SIZE];
-        trycall(lseek(fd, dirty_page, SEEK_SET), "compare seek mem");
-        trycall(read(fd, real_page, PAGE_SIZE), "compare read mem");
-        close(fd);
-        struct pt_entry entry = *mem_pt(current->mem, PAGE(dirty_page));
-        void *fake_page = entry.data->data + entry.offset;
+        page_t cursor = 0;
+        addr_t dirty_page;
+        while (tlb_dirty_trace_next(tlb, &cursor, &dirty_page)) {
+            char real_page[PAGE_SIZE];
+            trycall(lseek(fd, dirty_page, SEEK_SET), "compare seek mem");
+            trycall(read(fd, real_page, PAGE_SIZE), "compare read mem");
+            struct pt_entry entry = *mem_pt(current->mem, PAGE(dirty_page));
+            void *fake_page = entry.data->data + entry.offset;
 
-        if (memcmp(real_page, fake_page, PAGE_SIZE) != 0) {
-            printk("page %x doesn't match\n", dirty_page);
-            debugger;
-            return -1;
+            if (memcmp(real_page, fake_page, PAGE_SIZE) != 0) {
+                close(fd);
+                printk("page %x doesn't match\n", dirty_page);
+                debugger;
+                return -1;
+            }
         }
-        tlb->dirty_page = TLB_PAGE_EMPTY;
+        close(fd);
+        tlb_dirty_trace_finish(tlb, true);
     }
 
     setregs(pid, &regs);
@@ -483,8 +488,10 @@ int main(int argc, char *const argv[]) {
 
     struct cpu_state *cpu = &current->cpu;
     cpu->tf = true;
-    struct tlb tlb;
+    struct tlb tlb = {};
     tlb_refresh(&tlb, cpu->mmu);
+    if (!tlb_dirty_trace_attach(&tlb))
+        die("out of memory allocating exact dirty-page trace");
     int undefined_flags = 2;
     struct cpu_state old_cpu = *cpu;
     int i = 0;

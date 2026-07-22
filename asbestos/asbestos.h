@@ -27,9 +27,15 @@ struct asbestos {
         struct list blocks[2];
     } *page_hash;
 
+    // page_hash occupancy is summarized atomically so dirty drains can avoid
+    // the global mutation lock for buckets that provably contain no code.
+    // Counts are protected by lock; occupancy publication uses release/acquire.
+    unsigned page_hash_counts[FIBER_PAGE_HASH_SIZE];
+    _Atomic uint64_t page_hash_occupied[FIBER_PAGE_HASH_SIZE / 64];
+
     // Incremented on every block invalidation; used to invalidate persistent
     // per-thread block caches (which may hold pointers to jetsam'd blocks)
-    unsigned invalidate_gen;
+    _Atomic unsigned invalidate_gen;
 
     // Number of threads currently inside cpu_run_to_interrupt.
     // When 1, we can skip jetsam_lock (no other thread to synchronize with).
@@ -45,6 +51,10 @@ struct asbestos {
     // becomes non-empty. Threads check this to know when cleanup is needed.
     _Atomic unsigned jetsam_gen;
 
+    // Lock order is dirty_coherence_lock -> lock. Compilation holds this for
+    // write from before reading guest bytes through insertion. Dirty drains
+    // hold it for read until their set is either proven code-free or consumed.
+    wrlock_t dirty_coherence_lock;
     lock_t lock;
     wrlock_t jetsam_lock;
 };
@@ -85,11 +95,16 @@ extern volatile bool g_trace_highbits;
 struct asbestos *asbestos_new(struct mmu *mmu);
 void asbestos_free(struct asbestos *asbestos);
 
+struct tlb;
+
 // Invalidate all fiber blocks in pages start (inclusive) to end (exclusive).
 // Locks the asbestos. Should only be called by memory.c in conjunction with
 // mem_changed.
 void asbestos_invalidate_range(struct asbestos *asbestos, page_t start, page_t end);
 void asbestos_invalidate_page(struct asbestos *asbestos, page_t page);
 void asbestos_invalidate_all(struct asbestos *asbestos);
+// Consume every page-hash bucket marked by guest writes since the previous
+// translated-block boundary. Returns true when the dirty set was non-empty.
+bool asbestos_invalidate_dirty_pages(struct asbestos *asbestos, struct tlb *tlb);
 
 #endif

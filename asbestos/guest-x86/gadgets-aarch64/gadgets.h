@@ -36,6 +36,55 @@ _xaddr .req x3
 .endm
 
 # memory reading and writing
+// Preserve the memory-prep contract: only x8-x10 may be clobbered.
+.macro mark_dirty_page page
+    ldr w9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    str \page, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    cmp w9, \page
+    b.eq 99f
+    cmp w9, #TLB_PAGE_EMPTY
+    b.eq 98f
+    ubfx w9, w9, #12, #TLB_DIRTY_BUCKET_BITS
+    and w10, w9, #63
+    mov x8, #1
+    lsl x8, x8, x10
+    lsr w9, w9, #6
+    sub x10, _tlb, #(TLB_entries-TLB_dirty_page_buckets)
+    add x10, x10, x9, lsl #3
+    ldr x9, [x10]
+    orr x9, x9, x8
+    str x9, [x10]
+98:
+    // Exact tracer state is separate from the hashed runtime set and exists
+    // only when a differential tracer has explicitly attached it.
+    ldr x10, [_tlb, #(-TLB_entries+TLB_dirty_trace)]
+    cbz x10, 99f
+    ldr w9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    lsr w9, w9, #12
+    lsr w8, w9, #6
+    add x10, x10, #TLB_DIRTY_TRACE_page_bits
+    add x10, x10, x8, lsl #3
+    and w9, w9, #63
+    mov x8, #1
+    lsl x8, x8, x9
+    ldr x9, [x10]
+    orr x9, x9, x8
+    str x9, [x10]
+
+    ldr x10, [_tlb, #(-TLB_entries+TLB_dirty_trace)]
+    ldr w9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    lsr w9, w9, #18
+    lsr w8, w9, #6
+    add x10, x10, x8, lsl #3
+    and w9, w9, #63
+    mov x8, #1
+    lsl x8, x8, x9
+    ldr x9, [x10]
+    orr x9, x9, x8
+    str x9, [x10]
+99:
+.endm
+
 .irp type, read,write
 
 .macro \type\()_prep size, id
@@ -43,7 +92,6 @@ _xaddr .req x3
     cmp x8, #(0x1000-(\size/8))
     b.hi crosspage_load_\id
     and w8, _addr, #0xfffff000
-    str w8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
     ubfx x9, _xaddr, 12, 13
     eor x9, x9, _xaddr, lsr 25
     and w9, w9, #0x1fff
@@ -58,6 +106,9 @@ _xaddr .req x3
     b.ne handle_miss_\id
     ldr x10, [x9, #TLB_ENTRY_data_minus_addr]
     add _xaddr, x10, _xaddr, uxtx
+    .ifc \type,write
+        mark_dirty_page w8
+    .endif
 back_\id:
 .endm
 

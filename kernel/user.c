@@ -27,7 +27,12 @@ static int __user_write_task(struct task *task, addr_t addr, const void *buf, si
         char *ptr = mem_ptr(task->mem, p, ptrace ? MEM_WRITE_PTRACE : MEM_WRITE);
         if (ptr == NULL)
             return 1;
-        memcpy(ptr, &cbuf[p - addr], chunk_end - p);
+        size_t chunk_size = chunk_end - p;
+        memcpy(ptr, &cbuf[p - addr], chunk_size);
+        // mem_ptr invalidates before returning the writable pointer. A JIT
+        // compiler may publish old bytes in the interval before memcpy, so
+        // invalidate again after the actual mutation while mem->lock is held.
+        mem_did_write(task->mem, p, chunk_size);
         p = chunk_end;
     }
     return 0;

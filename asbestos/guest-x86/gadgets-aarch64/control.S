@@ -59,6 +59,9 @@
     ldr _ip, [_ip, 24]
     cmp _ip, #0
     b.lt 1f
+    ldr w9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    cmp w9, #TLB_PAGE_EMPTY
+    b.ne 2f
     sub x8, _ip, #FIBER_BLOCK_code
     str x8, [_cpu, #LOCAL_last_block]
     gret

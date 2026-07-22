@@ -33,6 +33,7 @@ extern void gadget_exit(void);
 extern void gadget_set_pc(void);
 extern void gadget_trace(void);
 extern void gadget_check_highbits(void);
+extern void gadget_ic_ivau(void);
 
 // Data processing gadgets
 extern void gadget_load_reg(void);
@@ -951,6 +952,13 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     state->orig_ip_extra = 0;
     state->tlb = tlb;
 
+    // A64 instructions are 4-byte aligned and therefore never straddle a 4K
+    // page. Reject a corrupted/misaligned PC before any decoder memory read.
+    if ((state->ip & 3) != 0) {
+        gen_interrupt(state, INT_GPF);
+        return 0;
+    }
+
     uint32_t insn;
     if (!arm64_read_insn(&state->ip, tlb, &insn)) {
         gen_interrupt(state, INT_GPF);
@@ -1097,6 +1105,11 @@ static bool simd_modimm_pattern(uint32_t cmode, uint8_t imm8, uint64_t *pattern)
  * Returns true if successful, false if read fails.
  */
 static bool gen_peek_next_insn(struct gen_state *state, uint32_t *next_insn) {
+    // Compilation's coherence writer pre-resolves only the page containing
+    // the current instruction. Do not let a peephole cross that boundary and
+    // trigger an MMU miss (or lazy mem-lock upgrade) inside the writer.
+    if (PAGE(state->ip) != PAGE(state->orig_ip))
+        return false;
     return tlb_read(state->tlb, state->ip, next_insn, sizeof(*next_insn));
 }
 
@@ -1504,7 +1517,8 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
                     if (!cmp_sh && cmp_rd == 31 && cmp_rn == rd) {
                         // Peek 2nd insn (B.cond)
                         addr_t br_ip = state->ip + 4;
-                        if (tlb_read(state->tlb, br_ip, &br_insn, sizeof(br_insn)) &&
+                        if (PAGE(br_ip) == PAGE(state->orig_ip) &&
+                            tlb_read(state->tlb, br_ip, &br_insn, sizeof(br_insn)) &&
                             (br_insn & 0xff000010) == 0x54000000) {
                             uint32_t cond = br_insn & 0xf;
                             init_fused_bcond_tables();
@@ -1937,16 +1951,24 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
             return 1;
         }
 
-        // Cache maintenance instructions (DC, IC) — NOP in emulation
+        // Cache maintenance instructions (DC, IC)
         // DC CIVAC (Clean and Invalidate by VA to PoC): d50b7e2x
         // DC CVAU  (Clean by VA to PoU):                d50b7b2x
         // DC CVAC  (Clean by VA to PoC):                d50b7a2x
         // IC IVAU  (Invalidate by VA to PoU):           d50b752x
+        if ((insn & 0xffffffe0) == 0xd50b7520) {  // IC IVAU
+            // IC maintenance is performed by the executing thread, which can
+            // have a different TLB from the writer. Publish the Xt page into
+            // this TLB's dirty set before returning to the dispatcher.
+            gen(state, (unsigned long) gadget_ic_ivau);
+            gen(state, insn & 0x1f);
+            gen_exit(state);
+            return 0;
+        }
         if ((insn & 0xffffffe0) == 0xd50b7e20 ||  // DC CIVAC
             (insn & 0xffffffe0) == 0xd50b7b20 ||  // DC CVAU
-            (insn & 0xffffffe0) == 0xd50b7a20 ||  // DC CVAC
-            (insn & 0xffffffe0) == 0xd50b7520) {  // IC IVAU
-            return 1;  // NOP — no cache to maintain
+            (insn & 0xffffffe0) == 0xd50b7a20) {  // DC CVAC
+            return 1;  // NOP — guest data and instruction bytes are coherent
         }
 
         // MRS/MSR NZCV (condition flags register)
