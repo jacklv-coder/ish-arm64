@@ -520,9 +520,9 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         /* Copy basic fields from real stat */
         fake_stat->size = real_stat.st_size;
         fake_stat->nlink = real_stat.st_nlink;
-        fake_stat->atime = real_stat.st_atimespec.tv_sec;
-        fake_stat->mtime = real_stat.st_mtimespec.tv_sec;
-        fake_stat->ctime = real_stat.st_ctimespec.tv_sec;
+        fake_stat->atime = real_stat.st_atime;
+        fake_stat->mtime = real_stat.st_mtime;
+        fake_stat->ctime = real_stat.st_ctime;
         err = 0;
     } else {
         err = realfs.stat(mount, path, fake_stat);
@@ -726,11 +726,11 @@ static void __attribute__((constructor)) init_fake_fdops() {
  * without escaping the sandbox (absolute symlinks fail on iOS). */
 static int create_relative_symlink(int root_fd, const char *host_link,
                                     const char *host_path) {
-    /* Get the absolute path of root_fd (F_GETPATH resolves symlinks,
-     * e.g. /var -> /private/var on iOS) */
+    /* Get the absolute path of root_fd. On iOS, F_GETPATH resolves symlinks
+     * such as /var -> /private/var. */
     char root_abs[PATH_MAX];
-    if (fcntl(root_fd, F_GETPATH, root_abs) != 0) {
-        fprintf(stderr, "create_relative_symlink: F_GETPATH failed\n");
+    if (realfs_host_getpath(root_fd, root_abs) < 0) {
+        fprintf(stderr, "create_relative_symlink: getpath failed\n");
         /* Fall back to absolute symlink */
         return symlinkat(host_path, root_fd, host_link);
     }
@@ -805,11 +805,11 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
     /* Log root_fd info for context */
     {
         char fd_path[PATH_MAX];
-        if (fcntl(g_fakefs_mount->root_fd, F_GETPATH, fd_path) == 0) {
+        if (realfs_host_getpath(g_fakefs_mount->root_fd, fd_path) >= 0) {
             fprintf(stderr, "fakefs_bind_mount: root_fd=%d path=\"%s\"\n",
                     g_fakefs_mount->root_fd, fd_path);
         } else {
-            fprintf(stderr, "fakefs_bind_mount: root_fd=%d (F_GETPATH failed)\n",
+            fprintf(stderr, "fakefs_bind_mount: root_fd=%d (getpath failed)\n",
                     g_fakefs_mount->root_fd);
         }
     }
@@ -826,7 +826,7 @@ int fakefs_bind_mount(const char *linux_path, const char *host_path, bool read_o
         return _ENOENT;
     }
 
-    /* Resolve symlinks in host_path so it matches what F_GETPATH returns.
+    /* Resolve symlinks in host_path so it matches the descriptor path lookup.
      * e.g. ~/Library/GroupContainersAlias/... -> ~/Library/Group Containers/... */
     char resolved_host[PATH_MAX];
     if (realpath(host_path, resolved_host) != NULL)

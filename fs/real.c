@@ -25,7 +25,7 @@
 #include "fs/tty.h"
 #include "util/fchdir.h"
 
-static int getpath(int fd, char *buf) {
+int realfs_host_getpath(int fd, char *buf) {
 #if defined(__linux__)
     char proc_fd[20];
     sprintf(proc_fd, "/proc/self/fd/%d", fd);
@@ -401,7 +401,7 @@ ssize_t realfs_readlink(struct mount *mount, const char *path, char *buf, size_t
 }
 
 int realfs_getpath(struct fd *fd, char *buf) {
-    int err = getpath(fd->real_fd, buf);
+    int err = realfs_host_getpath(fd->real_fd, buf);
     if (err < 0)
         return err;
 
