@@ -117,11 +117,22 @@ void cpu() {
     MACRO(MEM_WRITE);
 
     OFFSET(FIBER_BLOCK, fiber_block, addr);
+    OFFSET(FIBER_BLOCK, fiber_block, end_addr);
     OFFSET(FIBER_BLOCK, fiber_block, code);
 
     OFFSET(TLB, tlb, entries);
     OFFSET(TLB, tlb, dirty_page);
+    OFFSET(TLB, tlb, dirty_page_buckets);
+#if defined(GUEST_X86)
+    OFFSET(TLB, tlb, dirty_trace);
+    OFFSET(TLB_DIRTY_TRACE, tlb_dirty_trace, summary_bits);
+    OFFSET(TLB_DIRTY_TRACE, tlb_dirty_trace, page_bits);
+#endif
+    OFFSET(TLB, tlb, mem_changes);
     OFFSET(TLB, tlb, segfault_addr);
+    MACRO(TLB_DIRTY_BUCKET_BITS);
+    MACRO(TLB_DIRTY_BUCKET_COUNT);
+    MACRO(TLB_PAGE_EMPTY);
     OFFSET(TLB_ENTRY, tlb_entry, page);
     OFFSET(TLB_ENTRY, tlb_entry, page_if_writable);
     OFFSET(TLB_ENTRY, tlb_entry, data_minus_addr);

@@ -17,6 +17,35 @@
 
 .extern fiber_exit
 
+// Return to the dispatcher only when the next translated block overlaps a
+// pending guest write. The most recent dirty page is exact; pages transitioned
+// away from are represented conservatively by page-hash bucket bits.
+// Clobbers r14/r15. _ip must point at the target block's code array.
+.macro dirty_pages_hit_current_block hit
+    movl -TLB_entries+TLB_dirty_page(%_tlb), %r14d
+    cmpl $TLB_PAGE_EMPTY, %r14d
+    je .Ldirty_safe\@
+
+    movl -FIBER_BLOCK_code+FIBER_BLOCK_addr(%_ip), %r15d
+    andl $0xfffff000, %r15d
+    cmpl %r15d, %r14d
+    je \hit
+    shrl $12, %r15d
+    andl $(TLB_DIRTY_BUCKET_COUNT-1), %r15d
+    btq %r15, -TLB_entries+TLB_dirty_page_buckets(%_tlb)
+    jc \hit
+
+    movl -FIBER_BLOCK_code+FIBER_BLOCK_end_addr(%_ip), %r15d
+    andl $0xfffff000, %r15d
+    cmpl %r15d, %r14d
+    je \hit
+    shrl $12, %r15d
+    andl $(TLB_DIRTY_BUCKET_COUNT-1), %r15d
+    btq %r15, -TLB_entries+TLB_dirty_page_buckets(%_tlb)
+    jc \hit
+.Ldirty_safe\@:
+.endm
+
 .macro .gadget name
     .global.name gadget_\()\name
 .endm
@@ -47,9 +76,32 @@
     .else
         cmpl TLB_ENTRY_page_if_writable(%_tlb,%r14), %r15d
     .endif
-    movl %r15d, -TLB_entries+TLB_dirty_page(%_tlb)
     jne handle_miss_\id
     addq TLB_ENTRY_data_minus_addr(%_tlb,%r14), %_addrq
+    .ifc \type,write
+        movl -TLB_entries+TLB_dirty_page(%_tlb), %r14d
+        movl %r15d, -TLB_entries+TLB_dirty_page(%_tlb)
+        cmpl %r15d, %r14d
+        je 99f
+        cmpl $TLB_PAGE_EMPTY, %r14d
+        je 98f
+        shrl $12, %r14d
+        andl $(TLB_DIRTY_BUCKET_COUNT-1), %r14d
+        btsq %r14, -TLB_entries+TLB_dirty_page_buckets(%_tlb)
+98:
+        // Tracers opt in to a full-page bitmap that is independent from the
+        // hashed runtime set. Record only on page transitions; repeated stores
+        // to the same page stay on the existing hot path above.
+        movq -TLB_entries+TLB_dirty_trace(%_tlb), %r14
+        testq %r14, %r14
+        jz 99f
+        movl -TLB_entries+TLB_dirty_page(%_tlb), %r15d
+        shrl $12, %r15d
+        btsq %r15, TLB_DIRTY_TRACE_page_bits(%r14)
+        shrq $6, %r15
+        btsq %r15, TLB_DIRTY_TRACE_summary_bits(%r14)
+99:
+    .endif
 back_\id :
 
 .pushsection_bullshit

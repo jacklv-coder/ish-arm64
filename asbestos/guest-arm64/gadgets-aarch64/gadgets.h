@@ -1,4 +1,5 @@
 #include "../../gadgets-generic.h"
+#include "../sysregs.h"
 #include "cpu-offsets.h"
 
 // === DEBUG ISOLATION SWITCHES ===
@@ -64,6 +65,41 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
 
 .extern fiber_exit
 
+// Return to the dispatcher only when the target block overlaps a pending guest
+// write. dirty_page retains the latest exact page; pages transitioned away
+// from are represented conservatively by page-hash bucket bits. Clobbers
+// x12-x15. `code` must point at the target block's code array.
+.macro dirty_pages_hit_block code, hit
+    ldr x12, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    cmp x12, #TLB_PAGE_EMPTY
+    b.eq .Ldirty_safe\@
+
+    ldr x13, [\code, #(-FIBER_BLOCK_code+FIBER_BLOCK_addr)]
+    and x13, x13, #0xfffffffffffff000
+    cmp x12, x13
+    b.eq \hit
+    ldr x14, [\code, #(-FIBER_BLOCK_code+FIBER_BLOCK_end_addr)]
+    and x14, x14, #0xfffffffffffff000
+    cmp x12, x14
+    b.eq \hit
+
+    sub x15, _tlb, #(TLB_entries-TLB_dirty_page_buckets)
+    ubfx x12, x13, #12, #TLB_DIRTY_BUCKET_BITS
+    lsr x13, x12, #6
+    ldr x13, [x15, x13, lsl #3]
+    and x12, x12, #63
+    lsr x13, x13, x12
+    tbnz x13, #0, \hit
+
+    ubfx x12, x14, #12, #TLB_DIRTY_BUCKET_BITS
+    lsr x14, x12, #6
+    ldr x14, [x15, x14, lsl #3]
+    and x12, x12, #63
+    lsr x14, x14, x12
+    tbnz x14, #0, \hit
+.Ldirty_safe\@:
+.endm
+
 .macro .gadget name
     .global NAME(gadget_\()\name)
     .align 4
@@ -98,6 +134,27 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
  *
  * These macros handle TLB lookups and memory access for the guest.
  */
+// Preserve the write_prep contract: only x8-x10 may be clobbered.
+.macro mark_dirty_page page
+    ldr x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    str \page, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    cmp x9, \page
+    b.eq 99f
+    cmp x9, #TLB_PAGE_EMPTY
+    b.eq 99f
+    ubfx x9, x9, #12, #TLB_DIRTY_BUCKET_BITS
+    and x10, x9, #63
+    mov x8, #1
+    lsl x8, x8, x10
+    lsr x9, x9, #6
+    sub x10, _tlb, #(TLB_entries-TLB_dirty_page_buckets)
+    add x10, x10, x9, lsl #3
+    ldr x9, [x10]
+    orr x9, x9, x8
+    str x9, [x10]
+99:
+.endm
+
 .irp type, read,write
 
 .macro \type\()_prep size, id
@@ -126,11 +183,8 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
 
     // Extract page-aligned address (48-bit address space, clear low 12 bits)
     and x8, x7, #0xfffffffffffff000
-    .ifc \type,write
-        str x8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
-    .endif
 
-    ldr x10, [_tlb, #(-TLB_entries + 16)]   // tlb->mem_changes
+    ldr x10, [_tlb, #(-TLB_entries+TLB_mem_changes)]
     ldr x9, [_tlb, #-TLB_entries]           // tlb->mmu
     ldr x9, [x9, #16]                       // mmu->changes
     cmp w10, w9
@@ -156,6 +210,9 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
 
     str x7, [_cpu, #CPU_segfault_addr]
     add x7, x10, x7                // host_addr = data_minus_addr + guest_addr
+    .ifc \type,write
+        mark_dirty_page x8
+    .endif
 back_\id:
 .endm
 
@@ -225,7 +282,6 @@ watch_hit_\id :
     cmp x8, #(0x1000-(\size/8))
     b.hi crosspage_write_prep_\id
     and x8, x7, #0xfffffffffffff000
-    str x8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
     ubfx x9, x7, #12, #13
     eor x9, x9, x7, lsr #25
     and w9, w9, #0x1fff
@@ -236,6 +292,7 @@ watch_hit_\id :
     b.ne handle_miss_\id
     ldr x10, [x9, #TLB_ENTRY_data_minus_addr]
     add x7, x10, x7
+    mark_dirty_page x8
     b back_\id
 .endif
 #endif

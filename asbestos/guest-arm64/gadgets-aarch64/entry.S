@@ -82,6 +82,9 @@ fiber_ret_chain:
 #else
     // Check bit 63: if set, it's a fake_ip (unchained) → return to main loop
     tbnz _pc, #63, fiber_ret
+    // Data-only stores can keep chaining. Stop only when the next translated
+    // block overlaps the pending exact/hash dirty-page set.
+    dirty_pages_hit_block _pc, poke
     // Check if we've been poked (timer interrupt pending)
     ldr x8, [_cpu, #CPU_poked_ptr]
     ldrb w8, [x8]
@@ -90,7 +93,7 @@ fiber_ret_chain:
     // On macOS, munmap+mmap reuses host virtual addresses, so stale TLB entries
     // silently read/write wrong data (no SIGSEGV). Must return to main loop
     // for TLB flush when the page table has changed.
-    ldr x8, [_tlb, #(-TLB_entries + 16)]   // tlb->mem_changes (unsigned, at offset 16)
+    ldr x8, [_tlb, #(-TLB_entries+TLB_mem_changes)]
     ldr x9, [_tlb, #-TLB_entries]           // tlb->mmu
     ldr x9, [x9, #16]                       // mmu->changes (uint64_t, at offset 16)
     cmp w8, w9                              // compare as 32-bit (mem_changes is unsigned)

@@ -58,6 +58,7 @@
     movq 24(%_ip), %_ip
     btq $63, %_ip
     jc 1f
+    dirty_pages_hit_current_block 2f
     leaq -FIBER_BLOCK_code(%_ip), %r15
     movq %r15, LOCAL_last_block(%_cpu)
     gret

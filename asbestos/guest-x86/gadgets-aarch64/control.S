@@ -59,6 +59,7 @@
     ldr _ip, [_ip, 24]
     cmp _ip, #0
     b.lt 1f
+    dirty_pages_hit_current_block 2f
     sub x8, _ip, #FIBER_BLOCK_code
     str x8, [_cpu, #LOCAL_last_block]
     gret

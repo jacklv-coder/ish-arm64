@@ -174,18 +174,26 @@ int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, uc_engine *uc, int unde
 
     uc_setregs(uc, &regs);
 
-    // compare pages marked dirty
-    if (tlb->dirty_page != TLB_PAGE_EMPTY) {
-        char real_page[PAGE_SIZE];
-        uc_trycall(uc_mem_read(uc, tlb->dirty_page, real_page, PAGE_SIZE), "compare read");
-        void *fake_page = mmu_translate(cpu->mmu, tlb->dirty_page, MEM_READ);
+    // Compare every exact page retained by the opt-in diagnostic trace. The
+    // runtime JIT invalidation set has already been drained by the dispatcher.
+    if (tlb_dirty_trace_has_pages(tlb)) {
+        page_t cursor = 0;
+        addr_t dirty_page;
+        while (tlb_dirty_trace_next(tlb, &cursor, &dirty_page)) {
+            char real_page[PAGE_SIZE];
+            uc_trycall(uc_mem_read(uc, dirty_page, real_page, PAGE_SIZE), "compare read");
+            void *fake_page = mmu_translate(cpu->mmu, dirty_page, MEM_READ);
 
-        if (memcmp(real_page, fake_page, PAGE_SIZE) != 0) {
-            printk("page %x doesn't match\n", tlb->dirty_page);
-            debugger;
-            return -1;
+            if (memcmp(real_page, fake_page, PAGE_SIZE) != 0) {
+                printk("page %x doesn't match\n", dirty_page);
+                debugger;
+                return -1;
+            }
         }
-        tlb->dirty_page = TLB_PAGE_EMPTY;
+        // A register/flags/FPU mismatch above also makes this comparison fail.
+        // Preserve the exact page set for debugger retry unless the complete
+        // CPU and memory comparison succeeded.
+        tlb_dirty_trace_finish(tlb, res == 0);
     }
 
     return res;
@@ -487,8 +495,10 @@ int main(int argc, char *const argv[]) {
     uc_engine *uc = start_unicorn(&current->cpu, &current->mm->mem);
 
     struct cpu_state *cpu = &current->cpu;
-    struct tlb tlb;
+    struct tlb tlb = {};
     tlb_refresh(&tlb, cpu->mmu);
+    if (!tlb_dirty_trace_attach(&tlb))
+        die("out of memory allocating exact dirty-page trace");
     int undefined_flags = 0;
     struct cpu_state old_cpu = *cpu;
     while (true) {
@@ -511,4 +521,3 @@ void dump_memory(uc_engine *uc, const char *file, addr_t start, size_t size) {
     fwrite(buf, 1, sizeof(buf), f);
     fclose(f);
 }
-

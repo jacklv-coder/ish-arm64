@@ -794,7 +794,6 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
 
     page_t page = PAGE(addr);
     struct pt_entry *entry = mem_pt(mem, page);
-    extern __thread volatile sig_atomic_t in_jit;
 
     if (entry == NULL) {
         // page does not exist
@@ -1000,6 +999,36 @@ have_entry:
     assert(old_ptr == NULL || old_ptr == ptr || type == MEM_WRITE_PTRACE);
 #endif
     return ptr;
+}
+
+void mem_did_write(struct mem *mem, addr_t addr, size_t size) {
+    if (size == 0)
+        return;
+
+    // All pointer-based writers report at most one page at a time. Treat an
+    // impossible range conservatively: wrapping the guest address or escaping
+    // the architecture's address space must never turn post-write invalidation
+    // into a silent no-op.
+    const addr_t addr_max = (addr_t) -1;
+    size_t tail = size - 1;
+    if (size > PAGE_SIZE || tail > (size_t) addr_max ||
+            addr > addr_max - (addr_t) tail) {
+        asbestos_invalidate_all(mem->mmu.asbestos);
+        return;
+    }
+
+    page_t first = PAGE(addr);
+    page_t last = PAGE(addr + (addr_t) tail);
+    if (first >= MEM_PAGES || last >= MEM_PAGES) {
+        asbestos_invalidate_all(mem->mmu.asbestos);
+        return;
+    }
+
+    // Keep data-only kernel-to-guest copies on the occupancy fast path. A
+    // page that has no translated block does not need the global JIT mutex.
+    asbestos_invalidate_page(mem->mmu.asbestos, first);
+    if (last != first)
+        asbestos_invalidate_page(mem->mmu.asbestos, last);
 }
 
 static void *mem_mmu_translate(struct mmu *mmu, addr_t addr, int type) {

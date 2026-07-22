@@ -171,6 +171,14 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
 
 // Must call with mem read-locked.
 void *mem_ptr(struct mem *mem, addr_t addr, int type);
+// Report bytes actually written through a pointer returned by
+// mem_ptr(..., MEM_WRITE*). Call while the same mem lock is still held and
+// after each successful page-sized-or-smaller mutation. Pointer preparation
+// invalidates before the write; this second edge closes the window in which a
+// concurrent compiler could publish bytes observed between preparation and
+// the mutation. Invalid or oversized ranges conservatively invalidate all
+// translated blocks.
+void mem_did_write(struct mem *mem, addr_t addr, size_t size);
 int mem_segv_reason(struct mem *mem, addr_t addr);
 
 extern size_t real_page_size;

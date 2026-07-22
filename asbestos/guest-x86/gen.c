@@ -89,11 +89,20 @@ void gen_exit(struct gen_state *state) {
 
 #define RESTORE_IP state->ip = state->orig_ip
 #define _READIMM(name, size) do {\
+    unsigned read_size = (size) / 8; \
+    if (state->ip < state->orig_ip || \
+            state->ip - state->orig_ip > 15 - read_size) UNDEFINED; \
     state->ip += size/8; \
     if (!tlb_read(tlb, state->ip - size/8, &name, size/8)) SEGFAULT; \
 } while (0)
 
-#define READMODRM if (!modrm_decode32(&state->ip, tlb, &modrm)) SEGFAULT
+#define READMODRM do { \
+    if (state->ip < state->orig_ip || state->ip - state->orig_ip > 15) UNDEFINED; \
+    enum modrm_decode_result result = modrm_decode32(&state->ip, tlb, &modrm, \
+            15 - (unsigned) (state->ip - state->orig_ip)); \
+    if (result == MODRM_DECODE_TOO_LONG) UNDEFINED; \
+    if (result == MODRM_DECODE_FAULT) SEGFAULT; \
+} while (0)
 #define READADDR _READIMM(addr_offset, 32)
 #define SEG_GS() seg_gs = true
 

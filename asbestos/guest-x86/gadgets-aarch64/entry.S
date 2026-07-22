@@ -21,6 +21,7 @@ NAME(fiber_enter):
 fiber_ret_chain:
     cmp _ip, #0
     b.lt fiber_ret
+    dirty_pages_hit_current_block poke
     ldr x8, [_cpu, #CPU_poked_ptr]
     ldrb w8, [x8]
     cmp w8, #0

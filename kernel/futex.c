@@ -364,6 +364,7 @@ static int futex_wake_op(addr_t uaddr, dword_t wake_max1, addr_t uaddr2,
             read_wrunlock(&current->mem->lock);
             return _ENOSYS;
     }
+    mem_did_write(current->mem, uaddr2, sizeof(*ptr));
     read_wrunlock(&current->mem->lock);
 
     int32_t sold = (int32_t)oldval;

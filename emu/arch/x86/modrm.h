@@ -37,12 +37,23 @@ static const unsigned rm_disp32 = reg_ebp;
 #define REG(byte) ((byte & 0b00111000) >> 3)
 #define RM(byte)  ((byte & 0b00000111) >> 0)
 
-// read modrm and maybe sib, output information into *modrm, return false for segfault
-static inline bool modrm_decode32(addr_t *ip, struct tlb *tlb, struct modrm *modrm) {
+// Read ModRM and optional SIB/displacement without exceeding the caller's
+// architectural 15-byte instruction budget. Distinguish #UD from a real fault.
+enum modrm_decode_result {
+    MODRM_DECODE_OK,
+    MODRM_DECODE_FAULT,
+    MODRM_DECODE_TOO_LONG,
+};
+
+static inline enum modrm_decode_result modrm_decode32(addr_t *ip,
+        struct tlb *tlb, struct modrm *modrm, unsigned bytes_left) {
 #define READ(thing) \
+    if (sizeof(thing) > bytes_left) \
+        return MODRM_DECODE_TOO_LONG; \
+    bytes_left -= sizeof(thing); \
     *ip += sizeof(thing); \
     if (!tlb_read(tlb, *ip - sizeof(thing), &(thing), sizeof(thing))) \
-        return false
+        return MODRM_DECODE_FAULT
 
     byte_t modrm_byte;
     READ(modrm_byte);
@@ -100,7 +111,7 @@ static inline bool modrm_decode32(addr_t *ip, struct tlb *tlb, struct modrm *mod
     if (modrm->type == modrm_mem_si)
         TRACE("index=%s<<%d ", reg32_name(modrm->index), modrm->shift);
 
-    return true;
+    return MODRM_DECODE_OK;
 }
 
 #endif

@@ -37,9 +37,12 @@
     b \unchained_label
 #else
     tbnz \reg, #63, \unchained_label
-    // Chained fast path — poke check + periodic timer
     ldr x11, [\reg, #(-FIBER_BLOCK_code + FIBER_BLOCK_addr)]
     str x11, [_cpu, #CPU_pc]
+    // Data-only stores can keep chaining. Stop only when this target block
+    // overlaps the pending exact/hash dirty-page set.
+    dirty_pages_hit_block \reg, 7778f
+    // Chained fast path — poke check + periodic timer
     // Increment cycle counter; exit to main loop every 1024 cycles for timer check
     ldr w8, [_cpu, #CPU_cycle]
     add w8, w8, #1
@@ -187,8 +190,11 @@
     ldr _pc, [x14, #16]          // x14[2] = return_cont (block->code or fake_ip)
     // Check if return_cont is chained (bit 63 clear = valid block->code)
     tbnz _pc, #63, ret_unchained
-    // Chained cache hit — continue immediately (no poke check, matches x86)
-    // Poke will be caught at the next branch via inline_chain
+    // Return-cache hits bypass inline_chain, so apply the same target-specific
+    // dirty-page guard before entering the cached continuation.
+    dirty_pages_hit_block _pc, ret_no_cache
+    // Chained cache hit — continue immediately. Poke will be caught at the
+    // next branch via inline_chain, matching the x86 return-cache path.
     sub x8, _pc, #FIBER_BLOCK_code
     str x8, [_cpu, #LOCAL_last_block]
     gret

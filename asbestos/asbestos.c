@@ -17,6 +17,9 @@
 #include "util/list.h"
 #include "util/signpost.h"
 
+_Static_assert(TLB_DIRTY_BUCKET_COUNT == FIBER_PAGE_HASH_SIZE,
+        "TLB dirty buckets must match the asbestos page hash");
+
 // Thread-local recovery state for JIT crash handling.
 // When a host SIGSEGV occurs inside JIT code (due to a stale TLB pointer
 // from a concurrent CoW), the signal handler redirects PC to
@@ -222,6 +225,26 @@ static void fiber_block_free(struct asbestos *asbestos, struct fiber_block *bloc
 static void fiber_free_jetsam(struct asbestos *asbestos);
 static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size);
 
+static inline unsigned asbestos_invalidate_gen_load(const struct asbestos *asbestos) {
+    return atomic_load_explicit(&asbestos->invalidate_gen, memory_order_acquire);
+}
+
+static inline void asbestos_invalidate_gen_advance(struct asbestos *asbestos) {
+    atomic_fetch_add_explicit(&asbestos->invalidate_gen, 1, memory_order_release);
+}
+
+static void tlb_sync_invalidation_generation(struct asbestos *asbestos, struct tlb *tlb) {
+    unsigned invalidate_gen = asbestos_invalidate_gen_load(asbestos);
+    if (tlb->block_cache_gen == invalidate_gen)
+        return;
+    memset(tlb->block_cache, 0, sizeof(tlb->block_cache));
+    tlb->block_cache_gen = invalidate_gen;
+    if (tlb->frame != NULL) {
+        memset(tlb->frame->ret_cache, 0, sizeof(tlb->frame->ret_cache));
+        tlb->frame->last_block = NULL;
+    }
+}
+
 struct asbestos *asbestos_new(struct mmu *mmu) {
 #if defined(GUEST_ARM64) && defined(__aarch64__)
     pthread_once(&jit_crash_handler_once, install_jit_crash_handler_once);
@@ -231,8 +254,12 @@ struct asbestos *asbestos_new(struct mmu *mmu) {
     fiber_resize_hash(asbestos, FIBER_INITIAL_HASH_SIZE);
     asbestos->page_hash = calloc(FIBER_PAGE_HASH_SIZE, sizeof(*asbestos->page_hash));
     list_init(&asbestos->jetsam);
+    wrlock_init(&asbestos->dirty_coherence_lock);
     lock_init(&asbestos->lock);
     wrlock_init(&asbestos->jetsam_lock);
+    atomic_init(&asbestos->invalidate_gen, 0);
+    for (unsigned word = 0; word < FIBER_PAGE_HASH_SIZE / 64; word++)
+        atomic_init(&asbestos->page_hash_occupied[word], 0);
     atomic_init(&asbestos->jit_active_threads, 0);
     atomic_init(&asbestos->jetsam_gen, 0);
     return asbestos;
@@ -250,6 +277,9 @@ void asbestos_free(struct asbestos *asbestos) {
     fiber_free_jetsam(asbestos);
     free(asbestos->page_hash);
     free(asbestos->hash);
+    wrlock_destroy(&asbestos->dirty_coherence_lock);
+    wrlock_destroy(&asbestos->jetsam_lock);
+    pthread_mutex_destroy(&asbestos->lock.m);
     free(asbestos);
 }
 
@@ -258,44 +288,75 @@ static inline struct list *blocks_list(struct asbestos *asbestos, page_t page, i
     return &asbestos->page_hash[page % FIBER_PAGE_HASH_SIZE].blocks[i];
 }
 
-void asbestos_invalidate_range(struct asbestos *absestos, page_t start, page_t end) {
-    lock(&absestos->lock);
+static inline unsigned page_hash_bucket(page_t page) {
+    return (unsigned) (page % FIBER_PAGE_HASH_SIZE);
+}
+
+static void page_hash_count_add(struct asbestos *asbestos, page_t page) {
+    unsigned bucket = page_hash_bucket(page);
+    if (asbestos->page_hash_counts[bucket]++ == 0) {
+        atomic_fetch_or_explicit(&asbestos->page_hash_occupied[bucket / 64],
+                UINT64_C(1) << (bucket % 64), memory_order_release);
+    }
+}
+
+static void page_hash_count_remove(struct asbestos *asbestos, page_t page) {
+    unsigned bucket = page_hash_bucket(page);
+    assert(asbestos->page_hash_counts[bucket] != 0);
+    if (--asbestos->page_hash_counts[bucket] == 0) {
+        atomic_fetch_and_explicit(&asbestos->page_hash_occupied[bucket / 64],
+                ~(UINT64_C(1) << (bucket % 64)), memory_order_release);
+    }
+}
+
+// dirty_coherence_lock must already be held for read. This helper then takes
+// asbestos->lock, preserving the global coherence -> mutation lock order.
+static void asbestos_invalidate_range_coherent(struct asbestos *asbestos,
+        page_t start, page_t end) {
+    lock(&asbestos->lock);
     bool did_invalidate = false;
     struct fiber_block *block, *tmp;
     for (page_t page = start; page < end; page++) {
         for (int i = 0; i <= 1; i++) {
-            struct list *blocks = blocks_list(absestos, page, i);
+            struct list *blocks = blocks_list(asbestos, page, i);
             if (list_null(blocks))
                 continue;
             list_for_each_entry_safe(blocks, block, tmp, page[i]) {
-                fiber_block_disconnect(absestos, block);
+                page_t block_page =
+                        i == 0 ? PAGE(block->addr) : PAGE(block->end_addr);
+                if (block_page != page)
+                    continue;
+                fiber_block_disconnect(asbestos, block);
                 block->is_jetsam = true;
-                list_add(&absestos->jetsam, &block->jetsam);
+                list_add(&asbestos->jetsam, &block->jetsam);
                 did_invalidate = true;
             }
         }
     }
     if (did_invalidate)
-        absestos->invalidate_gen++;
-    unlock(&absestos->lock);
+        asbestos_invalidate_gen_advance(asbestos);
+    unlock(&asbestos->lock);
+}
+
+void asbestos_invalidate_range(struct asbestos *asbestos, page_t start, page_t end) {
+    read_wrlock(&asbestos->dirty_coherence_lock);
+    asbestos_invalidate_range_coherent(asbestos, start, end);
+    read_wrunlock(&asbestos->dirty_coherence_lock);
 }
 
 void asbestos_invalidate_page(struct asbestos *asbestos, page_t page) {
-    // Fast path: skip lock if no blocks exist on this page.
-    // page_hash is only modified under asbestos->lock, and list_null is a
-    // single pointer read, so a racy false-negative just means we take
-    // the slow path unnecessarily (safe). A false-positive is impossible
-    // because blocks are always added before being linked into page_hash.
-    for (int i = 0; i <= 1; i++) {
-        struct list *blocks = blocks_list(asbestos, page, i);
-        if (!list_null(blocks))
-            goto slow_path;
+    read_wrlock(&asbestos->dirty_coherence_lock);
+    unsigned bucket = page_hash_bucket(page);
+    uint64_t occupied = atomic_load_explicit(
+            &asbestos->page_hash_occupied[bucket / 64], memory_order_acquire);
+    if ((occupied & (UINT64_C(1) << (bucket % 64))) != 0) {
+        asbestos_invalidate_range_coherent(asbestos, page, page + 1);
     }
-    return;
-slow_path:
-    asbestos_invalidate_range(asbestos, page, page + 1);
+    read_wrunlock(&asbestos->dirty_coherence_lock);
 }
+
 void asbestos_invalidate_all(struct asbestos *asbestos) {
+    read_wrlock(&asbestos->dirty_coherence_lock);
     lock(&asbestos->lock);
     bool did_invalidate = false;
     struct fiber_block *block, *tmp;
@@ -313,8 +374,103 @@ void asbestos_invalidate_all(struct asbestos *asbestos) {
         }
     }
     if (did_invalidate)
-        asbestos->invalidate_gen++;
+        asbestos_invalidate_gen_advance(asbestos);
     unlock(&asbestos->lock);
+    read_wrunlock(&asbestos->dirty_coherence_lock);
+}
+
+bool asbestos_invalidate_dirty_pages(struct asbestos *asbestos, struct tlb *tlb) {
+    if (!tlb_has_runtime_dirty_pages(tlb))
+        return false;
+
+    // Preserve the exact final page for opt-in tracer diagnostics before the
+    // hashed runtime set is consumed. Assembly and C fast paths record page
+    // transitions too, so the diagnostic bitmap contains every touched page.
+    tlb_dirty_trace_mark_page(tlb, tlb->dirty_page);
+
+    // Until the first page transition the runtime state still knows the exact
+    // page. Preserve that identity instead of collapsing a common single-page
+    // store run into a hash bucket and evicting unrelated colliding code.
+    bool has_prior_buckets = false;
+    for (unsigned word = 0; word < TLB_DIRTY_BUCKET_WORDS; word++) {
+        if (tlb->dirty_page_buckets[word] != 0) {
+            has_prior_buckets = true;
+            break;
+        }
+    }
+    if (!has_prior_buckets) {
+        page_t last_page = PAGE(tlb->dirty_page);
+        read_wrlock(&asbestos->dirty_coherence_lock);
+        unsigned bucket = page_hash_bucket(last_page);
+        uint64_t occupied = atomic_load_explicit(
+                &asbestos->page_hash_occupied[bucket / 64], memory_order_acquire);
+        if ((occupied & (UINT64_C(1) << (bucket % 64))) != 0) {
+            asbestos_invalidate_range_coherent(asbestos,
+                    last_page, last_page + 1);
+        }
+        tlb_clear_runtime_dirty_pages(tlb);
+        read_wrunlock(&asbestos->dirty_coherence_lock);
+        return true;
+    }
+
+    // Markers retain the last exact page and preserve buckets for pages they
+    // transition away from. Convert the final exact page here so single-page
+    // store runs take the exact path above, while mixed-version/debug assembly
+    // also cannot hide a later write behind an earlier bucket bit. Earlier
+    // page identities are hashed, so this multi-page path stays conservative.
+    unsigned last_bucket = (unsigned) (PAGE(tlb->dirty_page) & (TLB_DIRTY_BUCKET_COUNT - 1));
+    tlb->dirty_page_buckets[last_bucket / 64] |= UINT64_C(1) << (last_bucket % 64);
+
+    // Exclude a compiler from spanning this decision: a compiler that finished
+    // first has published occupancy, while one that starts later reads bytes
+    // after the guest stores represented by this dirty set.
+    read_wrlock(&asbestos->dirty_coherence_lock);
+    bool might_have_blocks = false;
+    for (unsigned word = 0; word < TLB_DIRTY_BUCKET_WORDS; word++) {
+        uint64_t occupied = atomic_load_explicit(
+                &asbestos->page_hash_occupied[word], memory_order_acquire);
+        if ((tlb->dirty_page_buckets[word] & occupied) != 0) {
+            might_have_blocks = true;
+            break;
+        }
+    }
+    if (!might_have_blocks) {
+        tlb_clear_runtime_dirty_pages(tlb);
+        read_wrunlock(&asbestos->dirty_coherence_lock);
+        return true;
+    }
+
+    // Compilation and insertion take dirty_coherence_lock for write before
+    // this lock. Keep that order and hold both through invalidation and clear,
+    // so no stale block can be published after this set is consumed.
+    lock(&asbestos->lock);
+    bool did_invalidate = false;
+    for (unsigned word = 0; word < TLB_DIRTY_BUCKET_WORDS; word++) {
+        uint64_t buckets = tlb->dirty_page_buckets[word];
+        while (buckets != 0) {
+            unsigned bit = (unsigned) __builtin_ctzll(buckets);
+            unsigned bucket = word * 64 + bit;
+            for (int i = 0; i <= 1; i++) {
+                struct list *blocks = &asbestos->page_hash[bucket].blocks[i];
+                if (list_null(blocks))
+                    continue;
+                struct fiber_block *block, *tmp;
+                list_for_each_entry_safe(blocks, block, tmp, page[i]) {
+                    fiber_block_disconnect(asbestos, block);
+                    block->is_jetsam = true;
+                    list_add(&asbestos->jetsam, &block->jetsam);
+                    did_invalidate = true;
+                }
+            }
+            buckets &= buckets - 1;
+        }
+    }
+    if (did_invalidate)
+        asbestos_invalidate_gen_advance(asbestos);
+    tlb_clear_runtime_dirty_pages(tlb);
+    unlock(&asbestos->lock);
+    read_wrunlock(&asbestos->dirty_coherence_lock);
+    return true;
 }
 
 static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size) {
@@ -343,8 +499,11 @@ static void fiber_insert(struct asbestos *asbestos, struct fiber_block *block) {
 
     list_init_add(&asbestos->hash[block->addr % asbestos->hash_size], &block->chain);
     list_init_add(blocks_list(asbestos, PAGE(block->addr), 0), &block->page[0]);
-    if (PAGE(block->addr) != PAGE(block->end_addr))
+    page_hash_count_add(asbestos, PAGE(block->addr));
+    if (PAGE(block->addr) != PAGE(block->end_addr)) {
         list_init_add(blocks_list(asbestos, PAGE(block->end_addr), 1), &block->page[1]);
+        page_hash_count_add(asbestos, PAGE(block->end_addr));
+    }
 }
 
 static struct fiber_block *fiber_lookup(struct asbestos *asbestos, addr_t addr) {
@@ -359,19 +518,64 @@ static struct fiber_block *fiber_lookup(struct asbestos *asbestos, addr_t addr) 
     return NULL;
 }
 
+static unsigned guest_max_instruction_length(void) {
+#ifdef GUEST_ARM64
+    return 4;
+#else
+    return 15;
+#endif
+}
+
+// Resolve every page that this compilation is allowed to decode before taking
+// dirty_coherence_lock for write. The normal task loop holds mem->lock for
+// read; resolving a lazy mapping while also holding the coherence writer could
+// otherwise release that read lock and deadlock against an invalidator that
+// still holds its own mem read lock while waiting for coherence.
+static void fiber_prepare_compile_pages(addr_t ip, struct tlb *tlb) {
+    (void) __tlb_read_ptr(tlb, ip);
+#ifdef GUEST_ARM64
+    // A64 instructions are fixed-width, 4-byte aligned, and PAGE_SIZE is a
+    // multiple of four. A valid instruction can therefore never straddle a
+    // page. gen_step rejects a misaligned PC before reading instruction bytes,
+    // so prefetching its next page would be both unnecessary and unsafe: at
+    // high guest addresses adjacent pages can alias the same direct-mapped TLB
+    // slot and the prefetch would evict the page we just resolved.
+    return;
+#else
+    unsigned max_length = guest_max_instruction_length();
+    if (PGOFFSET(ip) > PAGE_SIZE - max_length) {
+        addr_t next_page = TLB_PAGE(ip) + PAGE_SIZE;
+        // With a 32-bit guest page number and TLB_BITS=13, adjacent pages
+        // cannot alias this xor-folded direct-map index. Keep the invariant
+        // executable because a collision would make nofault decode reject a
+        // legal cross-page instruction.
+        assert(TLB_INDEX(ip) != TLB_INDEX(next_page));
+        (void) __tlb_read_ptr(tlb, next_page);
+    }
+#endif
+}
+
 static struct fiber_block *fiber_block_compile(addr_t ip, struct tlb *tlb) {
     ISH_SIGNPOST_SCOPE_BEGIN(jit, "block_compile", _bc_spid);
     struct gen_state state;
     TRACE("%d %08x --- compiling:\n", current_pid(), ip);
     gen_start(ip, &state);
     while (true) {
+        // Do not start decoding a later instruction that could cross the
+        // starting page. Only a first instruction already straddling the page
+        // is allowed; fiber_prepare_compile_pages resolved both of its pages.
+        // Consequently every decoder read under dirty_coherence_lock is a TLB
+        // hit and cannot attempt a mem read->write lock upgrade.
+        if (state.ip != ip &&
+                (PAGE(state.ip) != PAGE(ip) ||
+                 PGOFFSET(state.ip) > PAGE_SIZE - guest_max_instruction_length())) {
+            gen_exit(&state);
+            break;
+        }
         if (!gen_step(&state, tlb))
             break;
-        // no block should span more than 2 pages
-        // guarantee this by limiting total block size to 1 page
-        // guarantee that by stopping as soon as there's less space left than
-        // the maximum length of an x86 instruction
-        // TODO refuse to decode instructions longer than 15 bytes
+        // Keep a secondary total-size ceiling even though the page-boundary
+        // guard above normally ends the block first.
         if (state.ip - ip >= PAGE_SIZE - 15) {
             gen_exit(&state);
             break;
@@ -393,6 +597,11 @@ static void fiber_block_disconnect(struct asbestos *asbestos, struct fiber_block
     }
     list_remove(&block->chain);
     for (int i = 0; i <= 1; i++) {
+        if (asbestos != NULL && !list_null(&block->page[i]) &&
+                block->page[i].next != &block->page[i]) {
+            page_t page = i == 0 ? PAGE(block->addr) : PAGE(block->end_addr);
+            page_hash_count_remove(asbestos, page);
+        }
         list_remove_safe(&block->page[i]);
         list_remove_safe(&block->jumps_from_links[i]);
 
@@ -433,11 +642,12 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     read_wrlock(&asbestos->jetsam_lock);
 
     // Use persistent block cache and frame from TLB; invalidate when blocks are jetsam'd
-    bool caches_stale = (tlb->block_cache_gen != asbestos->invalidate_gen);
+    unsigned invalidate_gen = asbestos_invalidate_gen_load(asbestos);
+    bool caches_stale = (tlb->block_cache_gen != invalidate_gen);
     struct fiber_block **cache = tlb->block_cache;
     if (caches_stale) {
         memset(cache, 0, sizeof(tlb->block_cache));
-        tlb->block_cache_gen = asbestos->invalidate_gen;
+        tlb->block_cache_gen = invalidate_gen;
     }
 
     // Use persistent frame from TLB (avoids malloc/free + ret_cache zeroing)
@@ -468,9 +678,10 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         // Check if blocks were invalidated since last check (e.g. CoW by another thread).
         // This must be inside the loop, not just at function entry, because invalidation
         // can happen while we're in the JIT cycle (between fiber_enter calls).
-        if (tlb->block_cache_gen != asbestos->invalidate_gen) {
+        invalidate_gen = asbestos_invalidate_gen_load(asbestos);
+        if (tlb->block_cache_gen != invalidate_gen) {
             memset(cache, 0, sizeof(tlb->block_cache));
-            tlb->block_cache_gen = asbestos->invalidate_gen;
+            tlb->block_cache_gen = invalidate_gen;
             memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
         }
 
@@ -526,21 +737,29 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
             size_t cache_index = fiber_cache_hash(ip);
             block = cache[cache_index];
             if (block == NULL || block->addr != ip) {
+                fiber_prepare_compile_pages(ip, tlb);
+                // A dirty drain takes the shared side of this lock. Taking the
+                // write side before reading guest bytes prevents stale code
+                // from being inserted after that drain has cleared its set.
+                write_wrlock(&asbestos->dirty_coherence_lock);
                 lock(&asbestos->lock);
                 block = fiber_lookup(asbestos, ip);
                 if (block == NULL) {
+                    assert(!tlb->compile_nofault_reads);
+                    tlb->compile_nofault_reads = true;
                     block = fiber_block_compile(ip, tlb);
+                    tlb->compile_nofault_reads = false;
                     fiber_insert(asbestos, block);
                 } else {
                     TRACE("%d %08x --- missed cache\n", current_pid(), ip);
                 }
                 cache[cache_index] = block;
                 unlock(&asbestos->lock);
+                write_wrunlock(&asbestos->dirty_coherence_lock);
             }
         }
         struct fiber_block *last_block = frame->last_block;
         if (block != NULL && last_block != NULL &&
-                !last_block->is_jetsam && !block->is_jetsam &&
                 (last_block->jump_ip[0] != NULL ||
                  last_block->jump_ip[1] != NULL)) {
             if (trylock(&asbestos->lock) == 0) {
@@ -597,7 +816,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
             // Flush all caches to get fresh host pointers.
             tlb_flush(tlb);
             memset(cache, 0, sizeof(tlb->block_cache));
-            tlb->block_cache_gen = asbestos->invalidate_gen;
+            tlb->block_cache_gen = asbestos_invalidate_gen_load(asbestos);
             memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
             frame->last_block = NULL;
 
@@ -616,29 +835,19 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
 
         // (debug trace removed)
 
-        // Self-modifying / JIT-generated guest code: write gadgets record
-        // the guest page written into tlb->dirty_page. If we have cached
-        // translated blocks for that page, they must be jetsam'd before the
-        // next dispatch. Bun/Claude-Code hits this: it patches generated
-        // lock-free list/atomic code after first execution; without dirty
-        // page invalidation we keep running the stale placeholder block
-        // (mov x16, #0; cbz x16, loop) forever.
-        if (tlb->dirty_page != TLB_PAGE_EMPTY) {
-            asbestos_invalidate_page(asbestos, PAGE(tlb->dirty_page));
-            tlb->dirty_page = TLB_PAGE_EMPTY;
-            if (tlb->block_cache_gen != asbestos->invalidate_gen) {
-                memset(cache, 0, sizeof(tlb->block_cache));
-                tlb->block_cache_gen = asbestos->invalidate_gen;
-                memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
-                frame->last_block = NULL;
-            }
+        // Self-modifying / JIT-generated guest code: write paths OR every
+        // touched page-hash bucket into the TLB dirty set. Consume the entire
+        // set before dispatching again; a single last-page slot is not enough
+        // for cross-page stores or blocks that write several code pages.
+        if (asbestos_invalidate_dirty_pages(asbestos, tlb)) {
+            tlb_sync_invalidation_generation(asbestos, tlb);
         }
 
         // Check if page table changed (mmap/munmap by another thread) EVERY BLOCK.
         if (tlb->mem_changes != __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE)) {
             tlb_flush(tlb);
             memset(cache, 0, sizeof(tlb->block_cache));
-            tlb->block_cache_gen = asbestos->invalidate_gen;
+            tlb->block_cache_gen = asbestos_invalidate_gen_load(asbestos);
             memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
             frame->last_block = NULL;
         }
@@ -708,6 +917,12 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     __atomic_add_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
     tlb_refresh(tlb, cpu->mmu);
     int interrupt = (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
+    // Direct-chain guards force a dispatcher return before entering any target
+    // block that overlaps this set. The shared exit also covers x86
+    // single-step, timer/syscall returns, and every other early-return path:
+    // never let a following tlb_refresh discard writes before invalidation.
+    if (asbestos_invalidate_dirty_pages(asbestos, tlb))
+        tlb_sync_invalidation_generation(asbestos, tlb);
     cpu->trapno = interrupt;
     __atomic_sub_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
 

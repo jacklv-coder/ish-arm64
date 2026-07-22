@@ -24,6 +24,41 @@ _xaddr .req x3
 
 .extern fiber_exit
 
+// Return to the dispatcher only when the next translated block overlaps a
+// pending guest write. The most recent dirty page is exact; earlier pages use
+// conservative page-hash bucket bits. Clobbers x8-x11. _ip must point at the
+// target block's code array.
+.macro dirty_pages_hit_current_block hit
+    ldr w8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    cmp w8, #TLB_PAGE_EMPTY
+    b.eq .Ldirty_safe\@
+
+    ldr w9, [_ip, #(-FIBER_BLOCK_code+FIBER_BLOCK_addr)]
+    and w9, w9, #0xfffff000
+    cmp w8, w9
+    b.eq \hit
+    ldr w10, [_ip, #(-FIBER_BLOCK_code+FIBER_BLOCK_end_addr)]
+    and w10, w10, #0xfffff000
+    cmp w8, w10
+    b.eq \hit
+
+    sub x11, _tlb, #(TLB_entries-TLB_dirty_page_buckets)
+    ubfx w8, w9, #12, #TLB_DIRTY_BUCKET_BITS
+    lsr w9, w8, #6
+    ldr x9, [x11, x9, lsl #3]
+    and w8, w8, #63
+    lsr x9, x9, x8
+    tbnz x9, #0, \hit
+
+    ubfx w8, w10, #12, #TLB_DIRTY_BUCKET_BITS
+    lsr w10, w8, #6
+    ldr x10, [x11, x10, lsl #3]
+    and w8, w8, #63
+    lsr x10, x10, x8
+    tbnz x10, #0, \hit
+.Ldirty_safe\@:
+.endm
+
 .macro .gadget name
     .global NAME(gadget_\()\name)
     .align 4
@@ -36,6 +71,55 @@ _xaddr .req x3
 .endm
 
 # memory reading and writing
+// Preserve the memory-prep contract: only x8-x10 may be clobbered.
+.macro mark_dirty_page page
+    ldr w9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    str \page, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    cmp w9, \page
+    b.eq 99f
+    cmp w9, #TLB_PAGE_EMPTY
+    b.eq 98f
+    ubfx w9, w9, #12, #TLB_DIRTY_BUCKET_BITS
+    and w10, w9, #63
+    mov x8, #1
+    lsl x8, x8, x10
+    lsr w9, w9, #6
+    sub x10, _tlb, #(TLB_entries-TLB_dirty_page_buckets)
+    add x10, x10, x9, lsl #3
+    ldr x9, [x10]
+    orr x9, x9, x8
+    str x9, [x10]
+98:
+    // Exact tracer state is separate from the hashed runtime set and exists
+    // only when a differential tracer has explicitly attached it.
+    ldr x10, [_tlb, #(-TLB_entries+TLB_dirty_trace)]
+    cbz x10, 99f
+    ldr w9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    lsr w9, w9, #12
+    lsr w8, w9, #6
+    add x10, x10, #TLB_DIRTY_TRACE_page_bits
+    add x10, x10, x8, lsl #3
+    and w9, w9, #63
+    mov x8, #1
+    lsl x8, x8, x9
+    ldr x9, [x10]
+    orr x9, x9, x8
+    str x9, [x10]
+
+    ldr x10, [_tlb, #(-TLB_entries+TLB_dirty_trace)]
+    ldr w9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    lsr w9, w9, #18
+    lsr w8, w9, #6
+    add x10, x10, x8, lsl #3
+    and w9, w9, #63
+    mov x8, #1
+    lsl x8, x8, x9
+    ldr x9, [x10]
+    orr x9, x9, x8
+    str x9, [x10]
+99:
+.endm
+
 .irp type, read,write
 
 .macro \type\()_prep size, id
@@ -43,7 +127,6 @@ _xaddr .req x3
     cmp x8, #(0x1000-(\size/8))
     b.hi crosspage_load_\id
     and w8, _addr, #0xfffff000
-    str w8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
     ubfx x9, _xaddr, 12, 13
     eor x9, x9, _xaddr, lsr 25
     and w9, w9, #0x1fff
@@ -58,6 +141,9 @@ _xaddr .req x3
     b.ne handle_miss_\id
     ldr x10, [x9, #TLB_ENTRY_data_minus_addr]
     add _xaddr, x10, _xaddr, uxtx
+    .ifc \type,write
+        mark_dirty_page w8
+    .endif
 back_\id:
 .endm
 
