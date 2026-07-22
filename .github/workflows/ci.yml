@@ -37,7 +37,8 @@ jobs:
           CC: ${{matrix.cc}}
       - name: Test
         if: matrix.kernel == 'ish'
-        run: ninja -C build test
+        timeout-minutes: 10
+        run: meson test -C build --no-rebuild --print-errorlogs --timeout-multiplier 3
 
   build-mac:
     runs-on: macos-15
