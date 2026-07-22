@@ -82,11 +82,9 @@ fiber_ret_chain:
 #else
     // Check bit 63: if set, it's a fake_ip (unchained) → return to main loop
     tbnz _pc, #63, fiber_ret
-    // Guest stores may have modified an already translated page. Do not enter
-    // another chained block until the dispatcher has consumed the dirty set.
-    ldr x8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
-    cmp x8, #TLB_PAGE_EMPTY
-    b.ne poke
+    // Data-only stores can keep chaining. Stop only when the next translated
+    // block overlaps the pending exact/hash dirty-page set.
+    dirty_pages_hit_block _pc, poke
     // Check if we've been poked (timer interrupt pending)
     ldr x8, [_cpu, #CPU_poked_ptr]
     ldrb w8, [x8]

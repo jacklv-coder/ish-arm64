@@ -65,6 +65,41 @@ _addr   .req x7    // Changed from x3/x4 to x7 to avoid conflict with guest low 
 
 .extern fiber_exit
 
+// Return to the dispatcher only when the target block overlaps a pending guest
+// write. dirty_page retains the latest exact page; pages transitioned away
+// from are represented conservatively by page-hash bucket bits. Clobbers
+// x12-x15. `code` must point at the target block's code array.
+.macro dirty_pages_hit_block code, hit
+    ldr x12, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    cmp x12, #TLB_PAGE_EMPTY
+    b.eq .Ldirty_safe\@
+
+    ldr x13, [\code, #(-FIBER_BLOCK_code+FIBER_BLOCK_addr)]
+    and x13, x13, #0xfffffffffffff000
+    cmp x12, x13
+    b.eq \hit
+    ldr x14, [\code, #(-FIBER_BLOCK_code+FIBER_BLOCK_end_addr)]
+    and x14, x14, #0xfffffffffffff000
+    cmp x12, x14
+    b.eq \hit
+
+    sub x15, _tlb, #(TLB_entries-TLB_dirty_page_buckets)
+    ubfx x12, x13, #12, #TLB_DIRTY_BUCKET_BITS
+    lsr x13, x12, #6
+    ldr x13, [x15, x13, lsl #3]
+    and x12, x12, #63
+    lsr x13, x13, x12
+    tbnz x13, #0, \hit
+
+    ubfx x12, x14, #12, #TLB_DIRTY_BUCKET_BITS
+    lsr x14, x12, #6
+    ldr x14, [x15, x14, lsl #3]
+    and x12, x12, #63
+    lsr x14, x14, x12
+    tbnz x14, #0, \hit
+.Ldirty_safe\@:
+.endm
+
 .macro .gadget name
     .global NAME(gadget_\()\name)
     .align 4

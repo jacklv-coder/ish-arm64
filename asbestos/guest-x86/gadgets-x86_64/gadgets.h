@@ -17,6 +17,35 @@
 
 .extern fiber_exit
 
+// Return to the dispatcher only when the next translated block overlaps a
+// pending guest write. The most recent dirty page is exact; pages transitioned
+// away from are represented conservatively by page-hash bucket bits.
+// Clobbers r14/r15. _ip must point at the target block's code array.
+.macro dirty_pages_hit_current_block hit
+    movl -TLB_entries+TLB_dirty_page(%_tlb), %r14d
+    cmpl $TLB_PAGE_EMPTY, %r14d
+    je .Ldirty_safe\@
+
+    movl -FIBER_BLOCK_code+FIBER_BLOCK_addr(%_ip), %r15d
+    andl $0xfffff000, %r15d
+    cmpl %r15d, %r14d
+    je \hit
+    shrl $12, %r15d
+    andl $(TLB_DIRTY_BUCKET_COUNT-1), %r15d
+    btq %r15, -TLB_entries+TLB_dirty_page_buckets(%_tlb)
+    jc \hit
+
+    movl -FIBER_BLOCK_code+FIBER_BLOCK_end_addr(%_ip), %r15d
+    andl $0xfffff000, %r15d
+    cmpl %r15d, %r14d
+    je \hit
+    shrl $12, %r15d
+    andl $(TLB_DIRTY_BUCKET_COUNT-1), %r15d
+    btq %r15, -TLB_entries+TLB_dirty_page_buckets(%_tlb)
+    jc \hit
+.Ldirty_safe\@:
+.endm
+
 .macro .gadget name
     .global.name gadget_\()\name
 .endm

@@ -117,6 +117,7 @@ void cpu() {
     MACRO(MEM_WRITE);
 
     OFFSET(FIBER_BLOCK, fiber_block, addr);
+    OFFSET(FIBER_BLOCK, fiber_block, end_addr);
     OFFSET(FIBER_BLOCK, fiber_block, code);
 
     OFFSET(TLB, tlb, entries);

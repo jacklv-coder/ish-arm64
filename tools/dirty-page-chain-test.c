@@ -13,7 +13,7 @@
 struct fake_mmu {
     struct mmu mmu;
     addr_t base;
-    unsigned char bytes[3 * PAGE_SIZE];
+    unsigned char bytes[4 * PAGE_SIZE];
 };
 
 static void *fake_translate(struct mmu *mmu, addr_t addr, int type) {
@@ -69,8 +69,9 @@ static void assert_direct_chain(struct fiber_block *source, unsigned index,
     assert(*source->jump_ip[index] != source->old_jump_ip[index]);
 }
 
-static uint64_t run_guest(struct fake_mmu *fake, struct tlb *tlb,
-        addr_t pc, uint64_t x1, uint64_t x2) {
+static uint64_t run_guest_observing_cycles(struct fake_mmu *fake,
+        struct tlb *tlb, addr_t pc, uint64_t x1, uint64_t x2,
+        unsigned *cycles) {
     struct cpu_state cpu = {
         .mmu = &fake->mmu,
         .pc = pc,
@@ -78,7 +79,14 @@ static uint64_t run_guest(struct fake_mmu *fake, struct tlb *tlb,
         .x2 = x2,
     };
     assert(cpu_run_to_interrupt(&cpu, tlb) == INT_BREAKPOINT);
+    if (cycles != NULL)
+        *cycles = cpu.cycle;
     return cpu.x0;
+}
+
+static uint64_t run_guest(struct fake_mmu *fake, struct tlb *tlb,
+        addr_t pc, uint64_t x1, uint64_t x2) {
+    return run_guest_observing_cycles(fake, tlb, pc, x1, x2, NULL);
 }
 
 static unsigned invalidate_generation(const struct asbestos *asbestos) {
@@ -186,8 +194,68 @@ static void test_return_cache_dirty_boundary(void) {
     asbestos_free(asbestos);
 }
 
+static void test_data_only_store_keeps_direct_chains(void) {
+    static struct mmu_ops ops = {
+        .translate = fake_translate,
+        .translate_write_nofault = fake_translate_write_nofault,
+    };
+    struct fake_mmu fake = {
+        .mmu = {.ops = &ops},
+        .base = UINT64_C(0x480000),
+    };
+    struct asbestos *asbestos = asbestos_new(&fake.mmu);
+    struct tlb *tlb = calloc(1, sizeof(*tlb));
+    assert(asbestos != NULL && tlb != NULL);
+    fake.mmu.asbestos = asbestos;
+
+    const addr_t writer = fake.base;
+    const addr_t middle = fake.base + PAGE_SIZE;
+    const addr_t target = fake.base + 2 * PAGE_SIZE;
+    const addr_t data = fake.base + 3 * PAGE_SIZE;
+    const uint32_t writer_code[] = {
+        UINT32_C(0xb9000022), // STR W2, [X1]
+        branch_immediate(writer + sizeof(uint32_t), middle),
+    };
+    const uint32_t middle_code[] = {branch_immediate(middle, target)};
+    const uint32_t target_code[] = {
+        UINT32_C(0xd2800020), // MOV X0, #1
+        UINT32_C(0xd4200000), // BRK
+    };
+    put_insns(&fake, writer, writer_code,
+            sizeof(writer_code) / sizeof(writer_code[0]));
+    put_insns(&fake, middle, middle_code,
+            sizeof(middle_code) / sizeof(middle_code[0]));
+    put_insns(&fake, target, target_code,
+            sizeof(target_code) / sizeof(target_code[0]));
+
+    assert(run_guest(&fake, tlb, writer, data, UINT64_C(0x12345678)) == 1);
+    // A second warm-up lets the dispatcher publish and patch both successive
+    // direct targets before measuring an entirely chained traversal.
+    assert(run_guest(&fake, tlb, writer, data, UINT64_C(0x23456789)) == 1);
+    struct fiber_block *writer_block = find_block(asbestos, writer);
+    struct fiber_block *middle_block = find_block(asbestos, middle);
+    struct fiber_block *target_block = find_block(asbestos, target);
+    assert_direct_chain(writer_block, 0, middle_block);
+    assert_direct_chain(middle_block, 0, target_block);
+
+    unsigned before = invalidate_generation(asbestos);
+    unsigned cycles = 0;
+    assert(run_guest_observing_cycles(&fake, tlb, writer, data,
+            UINT64_C(0x87654321), &cycles) == 1);
+    // Both writer -> middle and middle -> target remain in the JIT. The old
+    // unconditional dirty-page boundary exited before the first chain and
+    // observed only one chained transition here.
+    assert(cycles == 2);
+    assert(invalidate_generation(asbestos) == before);
+    assert(!tlb_has_runtime_dirty_pages(tlb));
+
+    tlb_free(tlb);
+    asbestos_free(asbestos);
+}
+
 int main(void) {
     test_direct_branch_dirty_boundary();
     test_return_cache_dirty_boundary();
+    test_data_only_store_keeps_direct_chains();
     return 0;
 }

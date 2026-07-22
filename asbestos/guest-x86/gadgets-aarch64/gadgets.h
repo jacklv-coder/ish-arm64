@@ -24,6 +24,41 @@ _xaddr .req x3
 
 .extern fiber_exit
 
+// Return to the dispatcher only when the next translated block overlaps a
+// pending guest write. The most recent dirty page is exact; earlier pages use
+// conservative page-hash bucket bits. Clobbers x8-x11. _ip must point at the
+// target block's code array.
+.macro dirty_pages_hit_current_block hit
+    ldr w8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    cmp w8, #TLB_PAGE_EMPTY
+    b.eq .Ldirty_safe\@
+
+    ldr w9, [_ip, #(-FIBER_BLOCK_code+FIBER_BLOCK_addr)]
+    and w9, w9, #0xfffff000
+    cmp w8, w9
+    b.eq \hit
+    ldr w10, [_ip, #(-FIBER_BLOCK_code+FIBER_BLOCK_end_addr)]
+    and w10, w10, #0xfffff000
+    cmp w8, w10
+    b.eq \hit
+
+    sub x11, _tlb, #(TLB_entries-TLB_dirty_page_buckets)
+    ubfx w8, w9, #12, #TLB_DIRTY_BUCKET_BITS
+    lsr w9, w8, #6
+    ldr x9, [x11, x9, lsl #3]
+    and w8, w8, #63
+    lsr x9, x9, x8
+    tbnz x9, #0, \hit
+
+    ubfx w8, w10, #12, #TLB_DIRTY_BUCKET_BITS
+    lsr w10, w8, #6
+    ldr x10, [x11, x10, lsl #3]
+    and w8, w8, #63
+    lsr x10, x10, x8
+    tbnz x10, #0, \hit
+.Ldirty_safe\@:
+.endm
+
 .macro .gadget name
     .global NAME(gadget_\()\name)
     .align 4

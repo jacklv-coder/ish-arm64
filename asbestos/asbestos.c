@@ -917,8 +917,9 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     __atomic_add_fetch(&asbestos->active_threads, 1, __ATOMIC_RELAXED);
     tlb_refresh(tlb, cpu->mmu);
     int interrupt = (CPU_HAS_SINGLE_STEP ? cpu_single_step : cpu_step_to_interrupt)(cpu, tlb);
-    // The normal dispatcher drains after every translated block. The shared
-    // exit is still required for x86 single-step and for any early-return path:
+    // Direct-chain guards force a dispatcher return before entering any target
+    // block that overlaps this set. The shared exit also covers x86
+    // single-step, timer/syscall returns, and every other early-return path:
     // never let a following tlb_refresh discard writes before invalidation.
     if (asbestos_invalidate_dirty_pages(asbestos, tlb))
         tlb_sync_invalidation_generation(asbestos, tlb);

@@ -39,11 +39,9 @@
     tbnz \reg, #63, \unchained_label
     ldr x11, [\reg, #(-FIBER_BLOCK_code + FIBER_BLOCK_addr)]
     str x11, [_cpu, #CPU_pc]
-    // A pending guest write must reach the dispatcher before another direct
-    // block executes, otherwise that block may be a stale translation.
-    ldr x8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
-    cmp x8, #TLB_PAGE_EMPTY
-    b.ne 7778f
+    // Data-only stores can keep chaining. Stop only when this target block
+    // overlaps the pending exact/hash dirty-page set.
+    dirty_pages_hit_block \reg, 7778f
     // Chained fast path — poke check + periodic timer
     // Increment cycle counter; exit to main loop every 1024 cycles for timer check
     ldr w8, [_cpu, #CPU_cycle]
@@ -192,11 +190,9 @@
     ldr _pc, [x14, #16]          // x14[2] = return_cont (block->code or fake_ip)
     // Check if return_cont is chained (bit 63 clear = valid block->code)
     tbnz _pc, #63, ret_unchained
-    // Return-cache hits bypass inline_chain, so they need the same dirty-set
-    // boundary before entering the cached continuation.
-    ldr x8, [_tlb, #(-TLB_entries+TLB_dirty_page)]
-    cmp x8, #TLB_PAGE_EMPTY
-    b.ne ret_no_cache
+    // Return-cache hits bypass inline_chain, so apply the same target-specific
+    // dirty-page guard before entering the cached continuation.
+    dirty_pages_hit_block _pc, ret_no_cache
     // Chained cache hit — continue immediately. Poke will be caught at the
     // next branch via inline_chain, matching the x86 return-cache path.
     sub x8, _pc, #FIBER_BLOCK_code
