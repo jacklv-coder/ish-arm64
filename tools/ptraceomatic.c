@@ -20,7 +20,7 @@
 #include "fs/path.h"
 #include "fs/fd.h"
 #include "emu/interrupt.h"
-#include "emu/cpuid.h"
+#include "emu/arch/x86/cpuid.h"
 
 #include "kernel/elf.h"
 #include "tools/transplant.h"
@@ -494,7 +494,6 @@ int main(int argc, char *const argv[]) {
         die("out of memory allocating exact dirty-page trace");
     int undefined_flags = 2;
     struct cpu_state old_cpu = *cpu;
-    int i = 0;
     while (true) {
         while (compare_cpus(cpu, &tlb, pid, undefined_flags) < 0) {
             printk("failure: resetting cpu\n");
@@ -505,7 +504,6 @@ int main(int argc, char *const argv[]) {
         undefined_flags = undefined_flags_mask(cpu, &tlb);
         old_cpu = *cpu;
         step_tracing(cpu, &tlb, pid, sender, receiver);
-        i++;
     }
 }
 
