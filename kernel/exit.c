@@ -608,8 +608,12 @@ retry:
     current->blocking = true;
     {
         struct timespec waitpid_timeout = {.tv_sec = 1, .tv_nsec = 0};
-        if (wait_for(&current->group->child_exit, &pids_lock, &waitpid_timeout)) {
-            // Signal received during wait
+        int wait_err = wait_for(&current->group->child_exit, &pids_lock,
+                &waitpid_timeout);
+        if (wait_err == _EINTR) {
+            // Only an actual pending signal interrupts wait4. The bounded
+            // timeout is an internal polling detail and must retry instead of
+            // leaking EINTR to guests whose child runs for more than a second.
             got_signal = true;
         }
     }
