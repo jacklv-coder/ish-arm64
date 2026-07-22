@@ -46,9 +46,9 @@ struct tlb {
 
     // One bit per asbestos page-hash bucket. On a page transition the prior
     // exact page is ORed here; dirty_page keeps the current page and the
-    // dispatcher converts it before consuming the whole set. This defers
-    // bitmap work for common single-page store runs. Hash collisions remain
-    // conservative at asbestos_invalidate_page() granularity.
+    // dispatcher either consumes it exactly or converts it before consuming
+    // the whole set. This defers bitmap work and collision eviction for common
+    // single-page store runs; transitioned pages remain conservatively hashed.
     uint64_t dirty_page_buckets[TLB_DIRTY_BUCKET_WORDS];
 
 #if defined(GUEST_X86)

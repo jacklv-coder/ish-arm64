@@ -103,8 +103,9 @@ struct tlb;
 void asbestos_invalidate_range(struct asbestos *asbestos, page_t start, page_t end);
 void asbestos_invalidate_page(struct asbestos *asbestos, page_t page);
 void asbestos_invalidate_all(struct asbestos *asbestos);
-// Consume every page-hash bucket marked by guest writes since the previous
-// translated-block boundary. Returns true when the dirty set was non-empty.
+// Consume every page or conservative page-hash bucket marked by guest writes
+// since the previous translated-block boundary. Returns true when the dirty
+// set was non-empty.
 bool asbestos_invalidate_dirty_pages(struct asbestos *asbestos, struct tlb *tlb);
 
 #endif

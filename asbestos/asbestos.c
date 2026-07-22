@@ -322,6 +322,10 @@ static void asbestos_invalidate_range_coherent(struct asbestos *asbestos,
             if (list_null(blocks))
                 continue;
             list_for_each_entry_safe(blocks, block, tmp, page[i]) {
+                page_t block_page =
+                        i == 0 ? PAGE(block->addr) : PAGE(block->end_addr);
+                if (block_page != page)
+                    continue;
                 fiber_block_disconnect(asbestos, block);
                 block->is_jetsam = true;
                 list_add(&asbestos->jetsam, &block->jetsam);
@@ -384,10 +388,36 @@ bool asbestos_invalidate_dirty_pages(struct asbestos *asbestos, struct tlb *tlb)
     // transitions too, so the diagnostic bitmap contains every touched page.
     tlb_dirty_trace_mark_page(tlb, tlb->dirty_page);
 
+    // Until the first page transition the runtime state still knows the exact
+    // page. Preserve that identity instead of collapsing a common single-page
+    // store run into a hash bucket and evicting unrelated colliding code.
+    bool has_prior_buckets = false;
+    for (unsigned word = 0; word < TLB_DIRTY_BUCKET_WORDS; word++) {
+        if (tlb->dirty_page_buckets[word] != 0) {
+            has_prior_buckets = true;
+            break;
+        }
+    }
+    if (!has_prior_buckets) {
+        page_t last_page = PAGE(tlb->dirty_page);
+        read_wrlock(&asbestos->dirty_coherence_lock);
+        unsigned bucket = page_hash_bucket(last_page);
+        uint64_t occupied = atomic_load_explicit(
+                &asbestos->page_hash_occupied[bucket / 64], memory_order_acquire);
+        if ((occupied & (UINT64_C(1) << (bucket % 64))) != 0) {
+            asbestos_invalidate_range_coherent(asbestos,
+                    last_page, last_page + 1);
+        }
+        tlb_clear_runtime_dirty_pages(tlb);
+        read_wrunlock(&asbestos->dirty_coherence_lock);
+        return true;
+    }
+
     // Markers retain the last exact page and preserve buckets for pages they
     // transition away from. Convert the final exact page here so single-page
-    // store runs avoid bitmap arithmetic, while mixed-version/debug assembly
-    // also cannot hide a later write behind an earlier bucket bit.
+    // store runs take the exact path above, while mixed-version/debug assembly
+    // also cannot hide a later write behind an earlier bucket bit. Earlier
+    // page identities are hashed, so this multi-page path stays conservative.
     unsigned last_bucket = (unsigned) (PAGE(tlb->dirty_page) & (TLB_DIRTY_BUCKET_COUNT - 1));
     tlb->dirty_page_buckets[last_bucket / 64] |= UINT64_C(1) << (last_bucket % 64);
 
