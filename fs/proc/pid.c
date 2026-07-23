@@ -179,6 +179,7 @@ static int proc_pid_statm_show(struct proc_entry *entry, struct proc_data *buf) 
     if (task == NULL)
         return _ESRCH;
 
+    lock(&task->general_lock);
     struct proc_pid_mem_stats mem_stats;
     proc_pid_mem_stats_get(task, &mem_stats);
     proc_printf(buf, "%llu ", (unsigned long long) mem_stats.size); // total vm size
@@ -189,6 +190,7 @@ static int proc_pid_statm_show(struct proc_entry *entry, struct proc_data *buf) 
     proc_printf(buf, "%llu ", (unsigned long long) mem_stats.data); // data + stack
     proc_printf(buf, "%lu ", 0ul); // dirty (always 0 since linux 2.6)
     proc_printf(buf, "\n");
+    unlock(&task->general_lock);
 
     proc_put_task(task);
     return 0;
@@ -372,7 +374,9 @@ static int proc_pid_maps_show(struct proc_entry *entry, struct proc_data *buf) {
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
+    lock(&task->general_lock);
     proc_maps_dump(task, buf);
+    unlock(&task->general_lock);
     proc_put_task(task);
     return 0;
 }
@@ -381,18 +385,26 @@ static ssize_t proc_pid_mem_pread(struct proc_entry *entry, struct proc_data *bu
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
-    int result = user_read_task(task, (addr_t)offset, buf->data, buf->size);
+    lock(&task->general_lock);
+    int result = task->mem == NULL
+        ? _ESRCH
+        : user_read_task(task, (addr_t)offset, buf->data, buf->size);
+    unlock(&task->general_lock);
     proc_put_task(task);
-    return result ? -1 : buf->size;
+    return result < 0 ? result : result ? -1 : buf->size;
 }
 
 static ssize_t proc_pid_mem_pwrite(struct proc_entry *entry, struct proc_data *buf, off_t offset) {
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
-    int result = user_write_task_ptrace(task, (addr_t)offset, buf->data, buf->size);
+    lock(&task->general_lock);
+    int result = task->mem == NULL
+        ? _ESRCH
+        : user_write_task_ptrace(task, (addr_t)offset, buf->data, buf->size);
+    unlock(&task->general_lock);
     proc_put_task(task);
-    return result ? -1 : buf->size;
+    return result < 0 ? result : result ? -1 : buf->size;
 }
 
 

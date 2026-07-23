@@ -89,11 +89,24 @@ noreturn void do_exit(int status) {
             futex_wake(clear_tid, 1);
     }
 
-    // release all our resources (may already be NULL if force-released by do_exit_group)
+    // Serialize the address-space handoff with procfs readers. Those readers
+    // hold general_lock while borrowing task->mm/task->mem, just as exec does
+    // while replacing them. Without the lock, a reader can queue on mem.lock
+    // after this thread has begun mem_destroy(); Darwin then reports EBUSY when
+    // the just-unlocked pthread rwlock is destroyed.
+    //
+    // Release general_lock before taking pids_lock below to preserve the
+    // pids_lock -> general_lock order used by procfs.
+    lock(&current->general_lock);
     if (current->mm != NULL) {
         mm_release(current->mm);
         current->mm = NULL;
+        current->mem = NULL;
     }
+    unlock(&current->general_lock);
+
+    // release all our remaining resources (may already be NULL if
+    // force-released by do_exit_group)
     if (current->files != NULL) {
         fdtable_release(current->files);
         current->files = NULL;
