@@ -54,12 +54,18 @@ struct task *task_create_(struct task *parent) {
     list_init(&pid->pgroup);
 
     struct task *task = malloc(sizeof(struct task));
-    if (task == NULL)
+    if (task == NULL) {
+        unlock(&pids_lock);
         return NULL;
+    }
     *task = (struct task) {};
     if (parent != NULL)
         *task = *parent;
     task->pid = pid->id;
+
+    // procfs obtains task pointers under pids_lock and may immediately take
+    // general_lock. Initialize the copied mutex before publishing the task.
+    lock_init(&task->general_lock);
     pid->task = task;
 
 #ifdef GUEST_ARM64
@@ -91,7 +97,6 @@ struct task *task_create_(struct task *parent) {
     task->futex_pipe[0] = -1;
     task->futex_pipe[1] = -1;
     task->did_exec = false;
-    lock_init(&task->general_lock);
 
     task->sockrestart = (struct task_sockrestart) {};
     list_init(&task->sockrestart.listen);
