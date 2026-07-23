@@ -1,4 +1,10 @@
 if get_option('kernel') == 'ish'
+    if not meson.is_cross_build()
+        uname_test = executable('uname-test',
+            ['uname-test.c'], dependencies: [ish])
+        test('uname', uname_test)
+    endif
+
     # The differential tracers model the x86 guest CPU state.
     if guest_arch == 'x86'
         dirty_page_trace_test = executable('dirty-page-trace-test',

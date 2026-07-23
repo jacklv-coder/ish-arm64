@@ -1,4 +1,5 @@
 #include <sys/utsname.h>
+#include <stdio.h>
 #include <string.h>
 #include "kernel/calls.h"
 #include "platform/platform.h"
@@ -14,6 +15,10 @@
 const char *uname_version = "SUPER AWESOME";
 const char *uname_hostname_override = NULL;
 
+static void copy_uname_field(char destination[UNAME_LENGTH], const char *source) {
+    snprintf(destination, UNAME_LENGTH, "%s", source);
+}
+
 void do_uname(struct uname *uts) {
     struct utsname real_uname;
     uname(&real_uname);
@@ -22,16 +27,16 @@ void do_uname(struct uname *uts) {
         hostname = uname_hostname_override;
 
     memset(uts, 0, sizeof(struct uname));
-    strcpy(uts->system, "Linux");
-    strcpy(uts->hostname, hostname);
-    strcpy(uts->release, "4.20.69-ish");
+    copy_uname_field(uts->system, "Linux");
+    copy_uname_field(uts->hostname, hostname);
+    copy_uname_field(uts->release, "4.20.69-ish");
     snprintf(uts->version, sizeof(uts->version), "%s %s %s", uname_version, __DATE__, __TIME__);
 #if defined(GUEST_ARM64)
-    strcpy(uts->arch, "aarch64");
+    copy_uname_field(uts->arch, "aarch64");
 #else
-    strcpy(uts->arch, "i686");
+    copy_uname_field(uts->arch, "i686");
 #endif
-    strcpy(uts->domain, "(none)");
+    copy_uname_field(uts->domain, "(none)");
 }
 
 dword_t sys_uname(addr_t uts_addr) {

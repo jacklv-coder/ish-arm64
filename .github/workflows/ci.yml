@@ -38,7 +38,7 @@ jobs:
       - name: Test
         if: matrix.kernel == 'ish'
         timeout-minutes: 10
-        run: meson test -C build --no-rebuild --print-errorlogs dirty-page-trace float80
+        run: meson test -C build --no-rebuild --print-errorlogs dirty-page-trace float80 uname
       - name: End-to-end test
         if: matrix.kernel == 'ish'
         timeout-minutes: 20
@@ -67,8 +67,8 @@ jobs:
         if: matrix.kernel == 'ish'
         run: |
           meson setup build-arm64-ci -Dguest_arch=arm64 -Dkernel=ish -Dengine=asbestos
-          meson compile -C build-arm64-ci dirty-page-chain-test
-          meson test -C build-arm64-ci --no-rebuild --print-errorlogs dirty-page-chain
+          meson compile -C build-arm64-ci dirty-page-chain-test uname-test
+          meson test -C build-arm64-ci --no-rebuild --print-errorlogs dirty-page-chain uname
       - name: Build
         if: matrix.kernel == 'linux'
         run: xcodebuild -project iSH.xcodeproj -scheme iSH+Linux -arch x86_64 -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO
