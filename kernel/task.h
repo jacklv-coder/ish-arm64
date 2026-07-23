@@ -17,7 +17,7 @@
 struct task {
     struct cpu_state cpu;
     struct mm *mm; // locked by general_lock
-    struct mem *mem; // pointer to mm.mem, for convenience
+    struct mem *mem; // pointer to mm.mem, for convenience; locked by general_lock
     pthread_t thread;
     uint64_t threadid;
 
