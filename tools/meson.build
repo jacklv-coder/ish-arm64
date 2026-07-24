@@ -3,6 +3,10 @@ if get_option('kernel') == 'ish'
         uname_test = executable('uname-test',
             ['uname-test.c'], dependencies: [ish])
         test('uname', uname_test)
+
+        internal_signal_mask_test = executable('internal-signal-mask-test',
+            ['internal-signal-mask-test.c'], dependencies: [ish])
+        test('internal-signal-mask', internal_signal_mask_test)
     endif
 
     # The differential tracers model the x86 guest CPU state.
