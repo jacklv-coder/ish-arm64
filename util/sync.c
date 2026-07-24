@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include "kernel/task.h"
 #include "util/sync.h"
 #include "debug.h"
@@ -92,6 +93,13 @@ void notify_once(cond_t *cond) {
     pthread_cond_signal(&cond->cond);
 }
 
+int unblock_internal_signal(void) {
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGUSR1);
+    return pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
+}
+
 __thread sigjmp_buf unwind_buf;
 __thread bool should_unwind = false;
 
@@ -128,4 +136,3 @@ void sigusr1_handler() {
         }
     }
 #endif
-

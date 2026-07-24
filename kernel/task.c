@@ -197,6 +197,8 @@ void task_run_current() {
 
 static void *task_thread(void *vtask) {
     current = vtask;
+    if (unblock_internal_signal() != 0)
+        die("could not unblock internal signal for guest task");
     update_thread_name();
     task_run_current();
     die("task_thread returned"); // above function call should never return

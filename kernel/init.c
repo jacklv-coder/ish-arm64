@@ -21,7 +21,7 @@ int mount_root(const struct fs_ops *fs, const char *source) {
     return 0;
 }
 
-static void establish_signal_handlers() {
+void establish_signal_handlers() {
     extern void sigusr1_handler(int sig);
     struct sigaction sigact;
     sigact.sa_handler = sigusr1_handler;
@@ -29,6 +29,12 @@ static void establish_signal_handlers() {
     sigemptyset(&sigact.sa_mask);
     sigaddset(&sigact.sa_mask, SIGUSR1);
     sigaction(SIGUSR1, &sigact, NULL);
+    /* Embedded hosts may block SIGUSR1 before starting the kernel thread.
+     * sigaction installs the handler but does not change the inherited thread
+     * mask, so the internal poke would remain pending forever and guest
+     * signals could not interrupt blocking host syscalls. */
+    if (unblock_internal_signal() != 0)
+        die("could not unblock internal signal");
     signal(SIGPIPE, SIG_IGN);
 }
 
