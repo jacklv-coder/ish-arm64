@@ -405,13 +405,14 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
     return 0;
 }
 
-static int fakefs_rename(struct mount *mount, const char *src, const char *dst) {
+static int fakefs_rename(struct mount *mount, const char *src, const char *dst,
+                         int flags) {
     struct fakefs_db *fs = &mount->fakefs;
     if (is_under_readonly_bind_mount(src) || is_under_readonly_bind_mount(dst))
         return _EROFS;
     db_begin_write(fs);
     path_rename(fs, src, dst);
-    int err = realfs.rename(mount, src, dst);
+    int err = realfs.rename(mount, src, dst, flags);
     if (err < 0) {
         db_rollback(fs);
         return err;

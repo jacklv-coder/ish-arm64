@@ -53,7 +53,9 @@ int generic_getpath(struct fd *fd, char *buf);
 int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw);
 int generic_unlinkat(struct fd *at, const char *path);
 int generic_rmdirat(struct fd *at, const char *path);
-int generic_renameat(struct fd *src_at, const char *src, struct fd *dst_at, const char *dst);
+#define RENAME_NOREPLACE_ (1 << 0)
+int generic_renameat(struct fd *src_at, const char *src, struct fd *dst_at,
+                     const char *dst, int flags);
 int generic_symlinkat(const char *target, struct fd *at, const char *link);
 int generic_mknodat(struct fd *at, const char *path, mode_t_ mode, dev_t_ dev);
 int generic_seek(struct fd *fd, off_t_ off, int whence, size_t size);
@@ -136,7 +138,8 @@ struct fs_ops {
     int (*link)(struct mount *mount, const char *src, const char *dst);
     int (*unlink)(struct mount *mount, const char *path);
     int (*rmdir)(struct mount *mount, const char *path);
-    int (*rename)(struct mount *mount, const char *src, const char *dst);
+    int (*rename)(struct mount *mount, const char *src, const char *dst,
+                  int flags);
     int (*symlink)(struct mount *mount, const char *target, const char *link);
     int (*mknod)(struct mount *mount, const char *path, mode_t_ mode, dev_t_ dev);
     int (*mkdir)(struct mount *mount, const char *path, mode_t_ mode);

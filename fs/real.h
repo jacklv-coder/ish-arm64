@@ -12,7 +12,8 @@ ssize_t realfs_readlink(struct mount *mount, const char *path, char *buf, size_t
 int realfs_link(struct mount *mount, const char *src, const char *dst);
 int realfs_unlink(struct mount *mount, const char *path);
 int realfs_rmdir(struct mount *mount, const char *path);
-int realfs_rename(struct mount *mount, const char *src, const char *dst);
+int realfs_rename(struct mount *mount, const char *src, const char *dst,
+                  int flags);
 int realfs_symlink(struct mount *mount, const char *target, const char *link);
 int realfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ UNUSED(dev));
 

@@ -179,7 +179,8 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     return err;
 }
 
-int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw) {
+int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at,
+                     const char *dst_raw, int flags) {
     char src[MAX_PATH];
     /* Rename removes the src from its parent directory, so we also need
      * write permission on src's parent — not just dst's. */
@@ -199,7 +200,7 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
     else if (mount->fs->rename == NULL)
         err = _EPERM;
     else
-        err = mount->fs->rename(mount, src, dst);
+        err = mount->fs->rename(mount, src, dst, flags);
     mount_release(mount);
     mount_release(dst_mount);
     return err;

@@ -10,6 +10,11 @@
 #include <sys/xattr.h>
 #include <sys/file.h>
 #include <sys/statvfs.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#elif defined(__APPLE__)
+#include <sys/stdio.h>
+#endif
 #include <poll.h>
 
 #include "debug.h"
@@ -496,8 +501,27 @@ static int unlinkat_recursive(int parent_fd, const char *name) {
     return 0;
 }
 
-int realfs_rename(struct mount *mount, const char *src, const char *dst) {
-    int err = renameat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst));
+int realfs_rename(struct mount *mount, const char *src, const char *dst,
+                  int flags) {
+    int err;
+    if (flags == 0) {
+        err = renameat(mount->root_fd, fix_path(src),
+                       mount->root_fd, fix_path(dst));
+    } else if (flags == RENAME_NOREPLACE_) {
+#if defined(__APPLE__)
+        err = renameatx_np(mount->root_fd, fix_path(src),
+                           mount->root_fd, fix_path(dst), RENAME_EXCL);
+#elif defined(__linux__) && defined(SYS_renameat2)
+        err = (int) syscall(SYS_renameat2,
+                            mount->root_fd, fix_path(src),
+                            mount->root_fd, fix_path(dst),
+                            RENAME_NOREPLACE_);
+#else
+        return _EINVAL;
+#endif
+    } else {
+        return _EINVAL;
+    }
     if (err < 0)
         return errno_map();
     // Source is gone, destination appeared. Emit two events; the

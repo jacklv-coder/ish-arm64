@@ -287,7 +287,8 @@ int iosfs_close(struct fd *fd) {
     return err;
 }
 
-static int iosfs_rename(struct mount *mount, const char *src, const char *dst) {
+static int iosfs_rename(struct mount *mount, const char *src, const char *dst,
+                        int flags) {
     NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
     NSURL *src_url = url_for_path_in_mount(mount, src);
     NSURL *dst_url = url_for_path_in_mount(mount, dst);
@@ -297,8 +298,10 @@ static int iosfs_rename(struct mount *mount, const char *src, const char *dst) {
 
     [coordinator coordinateWritingItemAtURL:src_url options:NSFileCoordinatorWritingForMoving error:&error byAccessor:^(NSURL *url) {
         [coordinator itemAtURL:url willMoveToURL:dst_url];
-        err = realfs.rename(mount, path_for_url_in_mount(mount, url, src), dst);
-        [coordinator itemAtURL:url didMoveToURL:dst_url];
+        err = realfs.rename(mount, path_for_url_in_mount(mount, url, src),
+                            dst, flags);
+        if (err == 0)
+            [coordinator itemAtURL:url didMoveToURL:dst_url];
     }];
 
     return combine_error(error, err);
