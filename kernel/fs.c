@@ -152,7 +152,7 @@ dword_t sys_unlink(addr_t path_addr) {
 }
 
 dword_t sys_renameat2(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr, int_t flags) {
-    if (flags != 0)
+    if (flags & ~RENAME_NOREPLACE_)
         return _EINVAL;
     char src[MAX_PATH];
     if (user_read_string(src_addr, src, sizeof(src)))
@@ -160,14 +160,15 @@ dword_t sys_renameat2(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_
     char dst[MAX_PATH];
     if (user_read_string(dst_addr, dst, sizeof(dst)))
         return _EFAULT;
-    STRACE("renameat(%d, \"%s\", %d, \"%s\")", src_at_f, src, dst_at_f, dst);
+    STRACE("renameat2(%d, \"%s\", %d, \"%s\", %#x)",
+           src_at_f, src, dst_at_f, dst, flags);
     struct fd *src_at = at_fd(src_at_f);
     if (src_at == NULL)
         return _EBADF;
     struct fd *dst_at = at_fd(dst_at_f);
     if (dst_at == NULL)
         return _EBADF;
-    return generic_renameat(src_at, src, dst_at, dst);
+    return generic_renameat(src_at, src, dst_at, dst, flags);
 }
 
 dword_t sys_renameat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr) {
