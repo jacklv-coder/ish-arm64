@@ -707,6 +707,180 @@ static void test_force_detach_shuts_down_private_socket(void) {
     free(group);
 }
 
+static void test_force_detach_shuts_down_duplicated_private_socket(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+    task->files = fdtable_new(3);
+    assert(!IS_ERR(task->files));
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct fd *socket_fd = fd_create(&socket_fdops);
+    assert(socket_fd != NULL);
+    socket_fd->real_fd = sockets[0];
+    socket_fd->socket.domain = AF_INET_;
+    task->files->files[0] = socket_fd;
+    task->files->files[1] = fd_retain(socket_fd);
+    task->files->files[2] = fd_retain(socket_fd);
+    assert(atomic_load(&socket_fd->refcount) == 3);
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    assert(atomic_load(&socket_fd->real_fd) == -1);
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    char byte;
+    assert(read(sockets[1], &byte, sizeof(byte)) == 0);
+    close(sockets[1]);
+
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL, finish_detached_guest_exit, task) == 0);
+    assert(pthread_join(worker, NULL) == 0);
+
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
+static void test_force_detach_preserves_same_group_shared_fdtable(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+    leader->files = fdtable_new(3);
+    assert(!IS_ERR(leader->files));
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct fd *socket_fd = fd_create(&socket_fdops);
+    assert(socket_fd != NULL);
+    socket_fd->real_fd = sockets[0];
+    socket_fd->socket.domain = AF_INET_;
+    leader->files->files[0] = socket_fd;
+    leader->files->files[1] = fd_retain(socket_fd);
+    leader->files->files[2] = fd_retain(socket_fd);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    task->files = leader->files;
+    task->files->refcount++;
+    list_add(&group->threads, &task->group_links);
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    assert(atomic_load(&socket_fd->real_fd) == sockets[0]);
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    const char value = 'z';
+    assert(write(atomic_load(&socket_fd->real_fd), &value, 1) == 1);
+    char received = 0;
+    assert(read(sockets[1], &received, 1) == 1 && received == value);
+
+    // Once the last runnable owner releases the shared table, only the
+    // deferred reference remains. That transition must close the host socket
+    // so the blocked detached task can return and finish cleanup.
+    fdtable_release(leader->files);
+    leader->files = NULL;
+    assert(atomic_load(&socket_fd->real_fd) == -1);
+    char byte;
+    assert(read(sockets[1], &byte, sizeof(byte)) == 0);
+
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL, finish_detached_guest_exit, task) == 0);
+    assert(pthread_join(worker, NULL) == 0);
+
+    close(sockets[1]);
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
+static void test_force_detach_closes_table_after_every_owner_detaches(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *first = task_create_(leader);
+    struct task *second = task_create_(leader);
+    assert(first != NULL && second != NULL);
+    first->group = second->group = group;
+    first->tgid = second->tgid = leader->tgid;
+    list_add(&group->threads, &first->group_links);
+    list_add(&group->threads, &second->group_links);
+
+    first->files = fdtable_new(3);
+    assert(!IS_ERR(first->files));
+    second->files = first->files;
+    second->files->refcount++;
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct fd *socket_fd = fd_create(&socket_fdops);
+    assert(socket_fd != NULL);
+    socket_fd->real_fd = sockets[0];
+    socket_fd->socket.domain = AF_INET_;
+    first->files->files[0] = socket_fd;
+    first->files->files[1] = fd_retain(socket_fd);
+    first->files->files[2] = fd_retain(socket_fd);
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(first));
+    assert(atomic_load(&socket_fd->real_fd) == sockets[0]);
+    assert(task_force_detach_for_group_exit_locked(second));
+    assert(atomic_load(&socket_fd->real_fd) == -1);
+    assert(first->files->force_shutdown_complete);
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    char byte;
+    assert(read(sockets[1], &byte, sizeof(byte)) == 0);
+    close(sockets[1]);
+
+    pthread_t first_worker;
+    pthread_t second_worker;
+    assert(pthread_create(&first_worker, NULL,
+            finish_detached_guest_exit, first) == 0);
+    assert(pthread_create(&second_worker, NULL,
+            finish_detached_guest_exit, second) == 0);
+    assert(pthread_join(first_worker, NULL) == 0);
+    assert(pthread_join(second_worker, NULL) == 0);
+
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
 static void test_copied_group_drops_exit_only_state(void) {
     struct tgroup group = {
         .doing_group_exit = true,
@@ -837,6 +1011,9 @@ int main(void) {
     test_force_detach_preserves_externally_shared_fdtable();
     test_force_detach_preserves_fd_shared_by_copied_table();
     test_force_detach_shuts_down_private_socket();
+    test_force_detach_shuts_down_duplicated_private_socket();
+    test_force_detach_preserves_same_group_shared_fdtable();
+    test_force_detach_closes_table_after_every_owner_detaches();
     test_copied_group_drops_exit_only_state();
     test_group_exit_rejects_replacement_itimer();
     test_dispose_waits_for_pinned_ptrace_user();

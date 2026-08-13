@@ -139,27 +139,6 @@ void task_unpublish_locked(struct task *task) {
         pid->task = NULL;
 }
 
-bool task_fdtable_is_group_private_locked(struct task *task) {
-    if (task->files == NULL)
-        return true;
-    unsigned group_owners = 0;
-    for (dword_t id = 1; id <= MAX_PID; id++) {
-        struct task *owner = pids[id].task;
-        if (owner == NULL || owner->files != task->files)
-            continue;
-        if (owner->group != task->group)
-            return false;
-        group_owners++;
-    }
-    // Non-leader force-detached tasks have already been unpublished. Count
-    // this task explicitly; any remaining reference then belongs to a clone
-    // in flight or another unpublished group and makes early close unsafe.
-    struct pid *pid = pid_get(task->pid);
-    if (pid == NULL || pid->task != task)
-        group_owners++;
-    return atomic_load(&task->files->refcount) == group_owners;
-}
-
 void task_dispose_locked(struct task *task) {
     // pids_lock prevents a new ptrace lookup while this waits for an operation
     // that already pinned the task. Once the lock handoff completes, no ptrace

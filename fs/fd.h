@@ -171,6 +171,12 @@ struct fd_ops {
 
 struct fdtable {
     atomic_uint refcount;
+    // References owned by force-detached tasks. Protected by lock. When every
+    // remaining owner is deferred, host handles can be closed to wake them.
+    unsigned force_detached_refs;
+    // Prevent repeated descriptor scans as deferred owners finish. Protected
+    // by lock and set only after a complete shutdown pass.
+    bool force_shutdown_complete;
     unsigned size;
     struct fd **files;
     bits_t *cloexec;
@@ -179,9 +185,8 @@ struct fdtable {
 
 struct fdtable *fdtable_new(int size);
 void fdtable_release(struct fdtable *table);
-// Closes host-backed descriptors that are owned only by this table, without
-// freeing fd objects that a blocked syscall may still borrow.
-void fdtable_shutdown_exclusive(struct fdtable *table);
+void fdtable_mark_force_detached(struct fdtable *table);
+void fdtable_release_force_detached(struct fdtable *table);
 struct fdtable *fdtable_copy(struct fdtable *table);
 void fdtable_free(struct fdtable *table);
 void fdtable_do_cloexec(struct fdtable *table);

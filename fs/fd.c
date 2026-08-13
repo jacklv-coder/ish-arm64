@@ -61,6 +61,8 @@ struct fdtable *fdtable_new(int size) {
     if (fdt == NULL)
         return ERR_PTR(_ENOMEM);
     fdt->refcount = 1;
+    fdt->force_detached_refs = 0;
+    fdt->force_shutdown_complete = false;
     fdt->size = 0;
     fdt->files = NULL;
     fdt->cloexec = NULL;
@@ -75,18 +77,97 @@ struct fdtable *fdtable_new(int size) {
 
 static int fdtable_close(struct fdtable *table, fd_t f);
 
-void fdtable_shutdown_exclusive(struct fdtable *table) {
-    lock(&table->lock);
+static int fd_pointer_compare(const void *left, const void *right) {
+    uintptr_t left_value = (uintptr_t) *(struct fd *const *) left;
+    uintptr_t right_value = (uintptr_t) *(struct fd *const *) right;
+    return (left_value > right_value) - (left_value < right_value);
+}
+
+static void fdtable_shutdown_exclusive_without_storage_locked(
+        struct fdtable *table) {
     for (fd_t f = 0; (unsigned) f < table->size; f++) {
         struct fd *fd = table->files[f];
-        if (fd == NULL || atomic_load(&fd->refcount) != 1 ||
-                (fd->ops->close != realfs_close &&
-                 fd->ops != &socket_fdops))
+        if (fd == NULL || (fd->ops->close != realfs_close &&
+                           fd->ops != &socket_fdops))
+            continue;
+
+        bool already_counted = false;
+        for (fd_t earlier = 0; earlier < f; earlier++) {
+            if (table->files[earlier] == fd) {
+                already_counted = true;
+                break;
+            }
+        }
+        if (already_counted)
+            continue;
+
+        unsigned table_refs = 1;
+        for (fd_t later = f + 1; (unsigned) later < table->size; later++) {
+            if (table->files[later] == fd)
+                table_refs++;
+        }
+        if (atomic_load(&fd->refcount) != table_refs)
             continue;
         int real_fd = atomic_exchange(&fd->real_fd, -1);
         if (real_fd >= 0)
             close(real_fd);
     }
+}
+
+static void fdtable_shutdown_exclusive_locked(struct fdtable *table) {
+    if (table->force_shutdown_complete)
+        return;
+
+    struct fd **owned = malloc(sizeof(*owned) * table->size);
+    if (owned == NULL && table->size != 0) {
+        // Emergency teardown must still wake blocked host calls under memory
+        // pressure. This allocation-free fallback is slower, but it is used
+        // only when the linear-storage fast path cannot be allocated.
+        fdtable_shutdown_exclusive_without_storage_locked(table);
+        table->force_shutdown_complete = true;
+        return;
+    }
+
+    unsigned owned_count = 0;
+    for (fd_t f = 0; (unsigned) f < table->size; f++) {
+        struct fd *fd = table->files[f];
+        if (fd == NULL || (fd->ops->close != realfs_close &&
+                           fd->ops != &socket_fdops))
+            continue;
+        owned[owned_count++] = fd;
+    }
+
+    // Count aliases in one sorted pass. A table can contain thousands of
+    // duplicate descriptors, so rescanning the table per entry would make
+    // emergency teardown quadratic while holding its lock.
+    qsort(owned, owned_count, sizeof(*owned), fd_pointer_compare);
+    for (unsigned first = 0; first < owned_count;) {
+        struct fd *fd = owned[first];
+        unsigned after = first + 1;
+        while (after < owned_count && owned[after] == fd)
+            after++;
+
+        // Keep the host handle open when an fd object is also retained outside
+        // this table (for example by mmap, poll, or a copied descriptor table).
+        if (atomic_load(&fd->refcount) != after - first) {
+            first = after;
+            continue;
+        }
+        int real_fd = atomic_exchange(&fd->real_fd, -1);
+        if (real_fd >= 0)
+            close(real_fd);
+        first = after;
+    }
+    free(owned);
+    table->force_shutdown_complete = true;
+}
+
+void fdtable_mark_force_detached(struct fdtable *table) {
+    lock(&table->lock);
+    assert(table->force_detached_refs < atomic_load(&table->refcount));
+    table->force_detached_refs++;
+    if (table->force_detached_refs == atomic_load(&table->refcount))
+        fdtable_shutdown_exclusive_locked(table);
     unlock(&table->lock);
 }
 
@@ -94,6 +175,7 @@ void fdtable_shutdown_exclusive(struct fdtable *table) {
 void fdtable_release(struct fdtable *table) {
     lock(&table->lock);
     if (--table->refcount == 0) {
+        assert(table->force_detached_refs == 0);
         for (fd_t f = 0; (unsigned) f < table->size; f++)
             fdtable_close(table, f);
         free(table->files);
@@ -101,6 +183,29 @@ void fdtable_release(struct fdtable *table) {
         unlock(&table->lock);
         free(table);
     } else {
+        // The last runnable owner just exited. Closing host handles now wakes
+        // every force-detached owner still blocked in a host syscall.
+        if (table->force_detached_refs == atomic_load(&table->refcount))
+            fdtable_shutdown_exclusive_locked(table);
+        unlock(&table->lock);
+    }
+}
+
+void fdtable_release_force_detached(struct fdtable *table) {
+    lock(&table->lock);
+    assert(table->force_detached_refs > 0);
+    table->force_detached_refs--;
+    if (--table->refcount == 0) {
+        assert(table->force_detached_refs == 0);
+        for (fd_t f = 0; (unsigned) f < table->size; f++)
+            fdtable_close(table, f);
+        free(table->files);
+        free(table->cloexec);
+        unlock(&table->lock);
+        free(table);
+    } else {
+        if (table->force_detached_refs == atomic_load(&table->refcount))
+            fdtable_shutdown_exclusive_locked(table);
         unlock(&table->lock);
     }
 }
