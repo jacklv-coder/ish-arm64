@@ -81,6 +81,16 @@ struct task {
     dword_t exit_code;
     bool zombie;
     bool exiting;
+#define TASK_EXIT_RUNNING 0
+#define TASK_EXIT_NORMAL 1
+#define TASK_EXIT_FORCE_DETACHED 2
+    // Claims exclusive ownership of task teardown. This prevents normal exit
+    // and the group-exit safety valve from releasing resources concurrently.
+    atomic_int exit_state;
+    // Removed from Linux-visible state while its host pthread is still alive.
+    // The pthread keeps ownership of referenced runtime resources until it
+    // reaches a safe cleanup boundary.
+    atomic_bool force_detached;
 
     // this structure is allocated on the stack of the parent's clone() call
     struct vfork_info {
@@ -123,6 +133,26 @@ static inline void task_set_mm(struct task *task, struct mm *mm) {
 struct task *task_create_(struct task *parent);
 // Removes the process from the process table and frees it. Must be called with pids_lock.
 void task_destroy(struct task *task);
+// Removes PID/parent visibility without invalidating task storage. Must be
+// called with pids_lock held.
+void task_unpublish_locked(struct task *task);
+// Invalidates already-unpublished task storage and queues it for deferred free.
+// Must be called with pids_lock held.
+void task_dispose_locked(struct task *task);
+// Returns true if every published owner of task->files belongs to task's
+// exiting thread group. Must be called with pids_lock held.
+bool task_fdtable_is_group_private_locked(struct task *task);
+
+// Removes a host thread that did not respond to group exit from the visible
+// thread-group state. Must be called with pids_lock and task->group->lock held.
+// Resource ownership is intentionally part of this boundary so the forced
+// group-exit path can be covered by a deterministic host test.
+bool task_force_detach_for_group_exit_locked(struct task *task);
+// Releases a force-detached task after its host pthread returns.
+noreturn void task_finish_force_detached_exit(void);
+// Clears exit-only state after tgroup_copy duplicates the remaining group
+// configuration. Exposed so the copy contract can be unit-tested.
+void tgroup_reset_exit_state_after_copy(struct tgroup *group);
 
 // misc
 void vfork_notify(struct task *task);
@@ -171,6 +201,10 @@ struct tgroup {
     // TODO locking
     bool doing_group_exit;
     dword_t group_exit_code;
+    // Protected by pids_lock. Retains the group and leader storage until all
+    // force-detached host pthreads have returned.
+    unsigned force_detached_count;
+    bool reap_deferred;
 
     // Once V8 prints a fatal-abort prefix to stderr (e.g. "abort: " or
     // "# Fatal error"), suppress every subsequent stderr write from the

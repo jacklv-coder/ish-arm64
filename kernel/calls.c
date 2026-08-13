@@ -49,6 +49,8 @@ __thread volatile uint64_t jit_last_x10 = 0;
 __thread volatile int jit_crash_count = 0;
 
 void handle_interrupt(int interrupt) {
+    if (current->force_detached)
+        task_finish_force_detached_exit();
     struct cpu_state *cpu = &current->cpu;
     if (interrupt == INT_SYSCALL) {
         ISH_SIGNPOST_SCOPE_BEGIN(syscall, "syscall", _sc_spid);
@@ -67,6 +69,10 @@ void handle_interrupt(int interrupt) {
             STRACE(" = 0x%x\n", result);
             cpu->eax = result;
         }
+        // Match the ARM64 path: the task may have been detached while a host
+        // syscall was blocked, so do not dereference its group afterward.
+        if (current->force_detached)
+            task_finish_force_detached_exit();
         if (current->group->doing_group_exit)
             do_exit(current->group->group_exit_code);
 #elif defined(GUEST_ARM64)
@@ -146,6 +152,12 @@ void handle_interrupt(int interrupt) {
                 }
             }
         }
+        // Group exit may have detached this task while the host pthread was
+        // blocked inside the syscall above. Stop before touching group state;
+        // the parent is allowed to consume the visible zombie concurrently.
+        if (current->force_detached)
+            task_finish_force_detached_exit();
+
         // Update deadlock detection state.
         atomic_fetch_add(&current->group->syscall_count, 1);
         // Update last_unblocked_ns for non-blocking syscalls only.

@@ -115,7 +115,10 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
 int realfs_close(struct fd *fd) {
     if (fd->dir != NULL)
         closedir(fd->dir);
-    int err = close(fd->real_fd);
+    int real_fd = atomic_exchange(&fd->real_fd, -1);
+    if (real_fd < 0)
+        return 0;
+    int err = close(real_fd);
     if (err < 0)
         return errno_map();
     return 0;

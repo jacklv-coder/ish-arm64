@@ -7,6 +7,10 @@ if get_option('kernel') == 'ish'
         internal_signal_mask_test = executable('internal-signal-mask-test',
             ['internal-signal-mask-test.c'], dependencies: [ish])
         test('internal-signal-mask', internal_signal_mask_test)
+
+        task_lifetime_test = executable('task-lifetime-test',
+            ['task-lifetime-test.c'], dependencies: [ish])
+        test('task-lifetime', task_lifetime_test)
     endif
 
     # The differential tracers model the x86 guest CPU state.

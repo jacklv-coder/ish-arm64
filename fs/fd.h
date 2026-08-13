@@ -1,6 +1,7 @@
 #ifndef FD_H
 #define FD_H
 #include <dirent.h>
+#include <stdatomic.h>
 #include "kernel/memory.h"
 #include "util/list.h"
 #include "util/sync.h"
@@ -96,7 +97,7 @@ struct fd {
 
     // fs/inode data
     struct mount *mount;
-    int real_fd; // seeks on this fd require the lock TODO think about making a special lock just for that
+    atomic_int real_fd; // seeks on this fd require the lock TODO think about making a special lock just for that
     DIR *dir;
     struct inode_data *inode;
     ino_t fake_inode;
@@ -178,6 +179,9 @@ struct fdtable {
 
 struct fdtable *fdtable_new(int size);
 void fdtable_release(struct fdtable *table);
+// Closes host-backed descriptors that are owned only by this table, without
+// freeing fd objects that a blocked syscall may still borrow.
+void fdtable_shutdown_exclusive(struct fdtable *table);
 struct fdtable *fdtable_copy(struct fdtable *table);
 void fdtable_free(struct fdtable *table);
 void fdtable_do_cloexec(struct fdtable *table);

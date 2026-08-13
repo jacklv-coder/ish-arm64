@@ -16,6 +16,35 @@
 
 static void halt_system(void);
 
+// Must be called with group->lock held. Unpublishing the pointer before the
+// potentially blocking destroy prevents setitimer/alarm from acquiring the
+// group lock and entering timer_set() with timer storage being reclaimed.
+static struct timer *detach_tgroup_itimer_locked(struct tgroup *group) {
+    struct timer *timer = group->itimer;
+    group->itimer = NULL;
+    return timer;
+}
+
+static void release_tgroup_exit_timer(struct timer *timer) {
+    if (timer != NULL)
+        timer_free_sync(timer);
+}
+
+// Must be called with pids_lock held. Reaping can remove the Linux-visible
+// leader before a force-detached host pthread (or a late CLONE_THREAD child)
+// reaches its final exit boundary, so all three conditions are required.
+static void finish_deferred_tgroup_reap_locked(struct tgroup *group) {
+    if (!group->reap_deferred || group->force_detached_count != 0 ||
+            !list_empty(&group->threads))
+        return;
+
+    struct task *leader = group->leader;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    task_dispose_locked(leader);
+    free(group);
+}
+
 // Weak default: overridden by main.c in CLI builds.
 // In iOS/Xcode builds where main.c is not linked into libish.a,
 // this no-op prevents an undefined symbol error.
@@ -31,11 +60,14 @@ static bool exit_tgroup(struct task *task) {
     list_remove(&task->group_links);
     bool group_dead = list_empty(&group->threads);
     if (group_dead) {
-        // don't need to lock the group since the only pointers to it come from:
-        // - other threads' current->group, but there are none left thanks to that list_empty call
-        // - locking pids_lock first, which do_exit did
-        if (group->itimer)
-            timer_free(group->itimer);
+        // A force-detached host pthread is no longer in `threads`, but may
+        // still be returning from a syscall that borrows group resources.
+        if (group->force_detached_count == 0) {
+            lock(&group->lock);
+            struct timer *timer = detach_tgroup_itimer_locked(group);
+            unlock(&group->lock);
+            release_tgroup_exit_timer(timer);
+        }
 
         // The group will be removed from its group and session by reap_if_zombie,
         // because fish tries to set the pgid to that of an exited but not reaped
@@ -47,6 +79,174 @@ static bool exit_tgroup(struct task *task) {
 
 void (*exit_hook)(struct task *task, int code) = NULL;
 
+static void task_reparent_children_for_forced_exit_locked(struct task *task) {
+    // This task will not run the normal child-reparenting path. Move its
+    // children away before its storage can eventually be disposed. This is
+    // called both when detaching and at the final cleanup boundary: sys_clone
+    // may have been in flight during the first pass.
+    struct task *new_parent = pid_get_task(1);
+    if (new_parent == task ||
+            (new_parent != NULL && new_parent->group == task->group))
+        new_parent = NULL;
+    struct task *child, *tmp;
+    list_for_each_entry_safe(&task->children, child, tmp, siblings) {
+        list_remove(&child->siblings);
+        child->parent = new_parent;
+        if (new_parent != NULL)
+            list_add(&new_parent->children, &child->siblings);
+    }
+}
+
+bool task_force_detach_for_group_exit_locked(struct task *task) {
+    // ITIMER_REAL keeps a raw task pointer and its callback does not take
+    // pids_lock. Stop it while every task signal resource is still alive;
+    // timer_free waits for an in-flight callback to finish.
+    // A task that has claimed TASK_EXIT_NORMAL owns runtime teardown. Never
+    // steal that ownership: fdtable_release/mm_release may already be running.
+    // The force-detach path is only for a task still blocked in guest work.
+    int expected = TASK_EXIT_RUNNING;
+    if (!atomic_compare_exchange_strong(&task->exit_state, &expected,
+            TASK_EXIT_FORCE_DETACHED)) {
+        return false;
+    }
+    atomic_store(&task->force_detached, true);
+    task->exiting = true;
+
+    list_remove(&task->group_links);
+    task->group->force_detached_count++;
+
+    task_reparent_children_for_forced_exit_locked(task);
+
+    // A non-leader no longer needs PID or parent visibility; a leader must stay
+    // published so its parent can observe and reap the process exit.
+    if (!task_is_leader(task))
+        task_unpublish_locked(task);
+
+    // Only close host handles when the table and each fd object are exclusive.
+    // Otherwise delayed final release remains the safe fallback.
+    if (task_fdtable_is_group_private_locked(task) && task->files != NULL)
+        fdtable_shutdown_exclusive(task->files);
+
+    // The group lock is part of this function's caller contract. Do not wait
+    // for the timer callback while holding it: send_signal(SIGKILL) takes the
+    // same lock after ptrace operations and would otherwise form a cycle.
+    struct timer *timer = detach_tgroup_itimer_locked(task->group);
+    unlock(&task->group->lock);
+    release_tgroup_exit_timer(timer);
+    lock(&task->group->lock);
+    return true;
+}
+
+static void task_clear_child_tid(struct task *task) {
+    addr_t clear_tid = task->clear_tid;
+    task->clear_tid = 0;
+    if (clear_tid != 0 && task->mem != NULL) {
+        pid_t_ zero = 0;
+        if (user_write_task(task, clear_tid, &zero, sizeof(zero)) == 0)
+            futex_wake(clear_tid, 1);
+    }
+}
+
+static void task_release_pending_signals(struct task *task) {
+    struct sigqueue *sigqueue, *tmp;
+    list_for_each_entry_safe(&task->queue, sigqueue, tmp, queue) {
+        list_remove(&sigqueue->queue);
+        free(sigqueue);
+    }
+}
+
+static void task_release_futex_pipe(struct task *task) {
+    // Only the owning host pthread calls this after it has left futex_wait and
+    // removed its stack waiter from the global futex queue. A force-detached
+    // thread retains these descriptors until its safe exit boundary.
+    if (task->futex_pipe[0] != -1) {
+        close(task->futex_pipe[0]);
+        task->futex_pipe[0] = -1;
+    }
+    if (task->futex_pipe[1] != -1) {
+        close(task->futex_pipe[1]);
+        task->futex_pipe[1] = -1;
+    }
+}
+
+static void task_release_runtime_resources(struct task *task) {
+    lock(&task->general_lock);
+    if (task->mm != NULL) {
+        mm_release(task->mm);
+        task->mm = NULL;
+        task->mem = NULL;
+    }
+    unlock(&task->general_lock);
+    task_release_futex_pipe(task);
+    if (task->files != NULL) {
+        fdtable_release(task->files);
+        task->files = NULL;
+    }
+    if (task->fs != NULL) {
+        fs_info_release(task->fs);
+        task->fs = NULL;
+    }
+}
+
+noreturn void task_finish_force_detached_exit(void) {
+    struct task *task = current;
+    int exit_state = task == NULL ? TASK_EXIT_RUNNING :
+            atomic_load(&task->exit_state);
+    assert(exit_state == TASK_EXIT_FORCE_DETACHED);
+
+    // An overlapping ptrace request may still be reading registers or memory.
+    // Force-detach prevents new lookups; wait for the pinned reader before
+    // releasing the address space or other task-owned runtime state.
+    lock(&task->ptrace.lock);
+    // Preserve the CLONE_CHILD_CLEARTID contract while the address space is
+    // still available. This is idempotent with a partially completed do_exit.
+    task_clear_child_tid(task);
+    task_release_runtime_resources(task);
+    unlock(&task->ptrace.lock);
+
+    lock(&pids_lock);
+    if (task->sighand != NULL) {
+        sighand_release(task->sighand);
+        task->sighand = NULL;
+    }
+    task_release_pending_signals(task);
+    // A clone already in progress can publish a child after the detach pass,
+    // but not after this host pthread has reached its cleanup boundary. Catch
+    // that final child while pids_lock excludes task_create_.
+    task_reparent_children_for_forced_exit_locked(task);
+    struct tgroup *group = task->group;
+    assert(group->force_detached_count > 0);
+    group->force_detached_count--;
+
+    // Match normal exit ordering: a vfork parent may resume only after
+    // CLONE_CHILD_CLEARTID and every shared-address-space cleanup operation is
+    // complete. vfork_notify clears task->vfork before publishing the wake.
+    vfork_notify(task);
+
+    // Keep a detached leader excluded from ptrace until its zombie record is
+    // reaped. Its PID must remain published for wait(), but its address space
+    // and signal state no longer exist. Non-leaders are disposed below, so
+    // they do not need to make force_detached observable as false either.
+    current = NULL;
+
+    struct timer *timer = NULL;
+    if (group->force_detached_count == 0 && list_empty(&group->threads)) {
+        lock(&group->lock);
+        timer = detach_tgroup_itimer_locked(group);
+        unlock(&group->lock);
+    }
+    release_tgroup_exit_timer(timer);
+
+    // A leader remains as the zombie record until its parent reaps it. Other
+    // tasks are already unpublished and can be disposed immediately.
+    if (!task_is_leader(task))
+        task_dispose_locked(task);
+
+    finish_deferred_tgroup_reap_locked(group);
+    unlock(&pids_lock);
+    pthread_exit(NULL);
+}
+
 static struct task *find_new_parent(struct task *task) {
     struct task *new_parent;
     list_for_each_entry(&task->group->threads, new_parent, group_links) {
@@ -56,21 +256,13 @@ static struct task *find_new_parent(struct task *task) {
     return pid_get_task(1);
 }
 
-noreturn void do_exit(int status) {
+static noreturn void do_exit_claimed(int status) {
     if (current && current->pid == 1) {
         extern void dump_pc_hist(void);
         extern void dump_pc_trace(void);
         dump_pc_hist();
         dump_pc_trace();
     }
-    // If this thread was already marked as leaked by the safety valve,
-    // the group leader has finished exiting and the group struct may be
-    // freed. Don't touch any shared state — just kill the host thread.
-    if (current->exiting) {
-        current = NULL;
-        pthread_exit(NULL);
-    }
-
     // Block SIGSEGV during exit to prevent cosmetic crashes from host
     // pthread stack unwinding (especially with many threads exiting at once).
     if (current->group->doing_group_exit) {
@@ -82,12 +274,7 @@ noreturn void do_exit(int status) {
     }
 
     // has to happen before mm_release
-    addr_t clear_tid = current->clear_tid;
-    if (clear_tid) {
-        pid_t_ zero = 0;
-        if (user_put(clear_tid, zero) == 0)
-            futex_wake(clear_tid, 1);
-    }
+    task_clear_child_tid(current);
 
     // Serialize the address-space handoff with procfs readers. Those readers
     // hold general_lock while borrowing task->mm/task->mem, just as exec does
@@ -97,33 +284,7 @@ noreturn void do_exit(int status) {
     //
     // Release general_lock before taking pids_lock below to preserve the
     // pids_lock -> general_lock order used by procfs.
-    lock(&current->general_lock);
-    if (current->mm != NULL) {
-        mm_release(current->mm);
-        current->mm = NULL;
-        current->mem = NULL;
-    }
-    unlock(&current->general_lock);
-
-    // release all our remaining resources (may already be NULL if
-    // force-released by do_exit_group)
-    if (current->files != NULL) {
-        fdtable_release(current->files);
-        current->files = NULL;
-    }
-    if (current->fs != NULL) {
-        fs_info_release(current->fs);
-        current->fs = NULL;
-    }
-    // Close per-thread futex wakeup pipe
-    if (current->futex_pipe[0] != -1) {
-        close(current->futex_pipe[0]);
-        current->futex_pipe[0] = -1;
-    }
-    if (current->futex_pipe[1] != -1) {
-        close(current->futex_pipe[1]);
-        current->futex_pipe[1] = -1;
-    }
+    task_release_runtime_resources(current);
 
     // sighand must be released below so it can be protected by pids_lock
     // since it can be accessed by other threads
@@ -145,11 +306,7 @@ noreturn void do_exit(int status) {
         sighand_release(current->sighand);
         current->sighand = NULL;
     }
-    struct sigqueue *sigqueue, *sigqueue_tmp;
-    list_for_each_entry_safe(&current->queue, sigqueue, sigqueue_tmp, queue) {
-        list_remove(&sigqueue->queue);
-        free(sigqueue);
-    }
+    task_release_pending_signals(current);
     struct task *leader = current->group->leader;
 
     // reparent children
@@ -161,7 +318,8 @@ noreturn void do_exit(int status) {
         list_add(&new_parent->children, &child->siblings);
     }
 
-    if (exit_tgroup(current)) {
+    bool group_dead = exit_tgroup(current);
+    if (group_dead) {
         // If already marked zombie by do_exit_group force path, skip
         if (leader->zombie)
             goto skip_zombie_notify;
@@ -205,9 +363,23 @@ noreturn void do_exit(int status) {
         current = NULL;  // Clear before destroy to prevent dangling access
         task_destroy(self);
     }
+    if (group_dead)
+        finish_deferred_tgroup_reap_locked(leader->group);
     unlock(&pids_lock);
 
     pthread_exit(NULL);
+}
+
+noreturn void do_exit(int status) {
+    int expected = TASK_EXIT_RUNNING;
+    if (!atomic_compare_exchange_strong(&current->exit_state, &expected,
+            TASK_EXIT_NORMAL)) {
+        if (expected == TASK_EXIT_FORCE_DETACHED)
+            task_finish_force_detached_exit();
+        current = NULL;
+        pthread_exit(NULL);
+    }
+    do_exit_claimed(status);
 }
 
 noreturn void do_exit_group(int status) {
@@ -219,8 +391,11 @@ noreturn void do_exit_group(int status) {
         dump_gadget_profile();
     }
 #endif
-    // Leaked thread woke up after group already exited — bail silently.
-    if (current->exiting) {
+    int expected = TASK_EXIT_RUNNING;
+    if (!atomic_compare_exchange_strong(&current->exit_state, &expected,
+            TASK_EXIT_NORMAL)) {
+        if (expected == TASK_EXIT_FORCE_DETACHED)
+            task_finish_force_detached_exit();
         current = NULL;
         pthread_exit(NULL);
     }
@@ -352,27 +527,8 @@ noreturn void do_exit_group(int status) {
             struct task *task_tmp;
             list_for_each_entry_safe(&group->threads, task, task_tmp, group_links) {
                 if (task != current && !task->exiting) {
-                    task->exiting = true;
-                    list_remove(&task->group_links);
-                    // Release resources so pipes get EOF and memory is freed.
-                    if (task->sighand != NULL) {
-                        sighand_release(task->sighand);
-                        task->sighand = NULL;
-                    }
-                    if (task->mm != NULL) {
-                        mm_release(task->mm);
-                        task->mm = NULL;
-                        task->mem = NULL;
-                    }
-                    if (task->files != NULL) {
-                        fdtable_release(task->files);
-                        task->files = NULL;
-                    }
-                    if (task->fs != NULL) {
-                        fs_info_release(task->fs);
-                        task->fs = NULL;
-                    }
-                    leaked++;
+                    if (task_force_detach_for_group_exit_locked(task))
+                        leaked++;
                 }
             }
             unlock(&group->lock);
@@ -405,7 +561,7 @@ noreturn void do_exit_group(int status) {
     unlock(&group->lock);
     unlock(&pids_lock);
 
-    do_exit(status);
+    do_exit_claimed(status);
 }
 
 // always called from init process
@@ -515,13 +671,21 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
                current->pid, task->pid, (unsigned)exit_code, task->comm);
     }
 
-    // tear down group
-    cond_destroy(&task->group->child_exit);
+    // Remove Linux-visible group state immediately. If a host pthread was
+    // force-detached, retain the synchronization objects, group and leader
+    // storage until that pthread reaches its cleanup boundary.
+    struct tgroup *group = task->group;
     task_leave_session(task);
-    list_remove(&task->group->pgroup);
-    free(task->group);
-
-    task_destroy(task);
+    list_remove(&group->pgroup);
+    if (group->force_detached_count != 0 || !list_empty(&group->threads)) {
+        group->reap_deferred = true;
+        task_unpublish_locked(task);
+    } else {
+        cond_destroy(&group->child_exit);
+        cond_destroy(&group->stopped_cond);
+        free(group);
+        task_destroy(task);
+    }
     return true;
 }
 

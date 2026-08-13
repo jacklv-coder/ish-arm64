@@ -7,20 +7,24 @@
 
 // Returns stopped child with the given pid, locked with the ptrace lock
 static struct task *find_child(pid_t_ pid) {
-    struct task *child = NULL;
+    // pids_lock pins both the children list and task storage until ptrace.lock
+    // is acquired. Destruction takes the same locks in this order, then waits
+    // for an in-flight ptrace operation before invalidating the task.
+    lock(&pids_lock);
+    struct task *child;
     list_for_each_entry(&current->children, child, siblings) {
-        if (child->pid == pid) {
+        if (child->pid == pid && !child->exiting && !child->force_detached) {
             lock(&child->ptrace.lock);
             if (child->ptrace.stopped) {
-                goto found;
+                unlock(&pids_lock);
+                return child;
             }
 
             unlock(&child->ptrace.lock);
         }
     }
-    child = NULL;
-found:
-    return child;
+    unlock(&pids_lock);
+    return NULL;
 }
 
 #if defined(GUEST_ARM64)
@@ -114,8 +118,10 @@ dword_t sys_ptrace(dword_t request, dword_t pid, addr_t addr, addr_t data) {
             struct user_ user_ = {};
             get_user_regs(&child->cpu, &user_.user_regs);
 
-            if (addr & (sizeof(peek) - 1) || addr >= sizeof(struct user_))
+            if (addr & (sizeof(peek) - 1) || addr >= sizeof(struct user_)) {
+                unlock(&child->ptrace.lock);
                 return _EIO;
+            }
 
             memcpy(&peek, (char *)&user_ + addr, sizeof(peek));
             if (user_put(data, peek)) {
@@ -207,6 +213,7 @@ dword_t sys_ptrace(dword_t request, dword_t pid, addr_t addr, addr_t data) {
 
             struct user_regs_struct_ user_regs_;
             if (user_get(data, user_regs_)) {
+                unlock(&child->ptrace.lock);
                 return _EFAULT;
             } else {
                 set_user_regs(&child->cpu, &user_regs_);
@@ -240,6 +247,7 @@ dword_t sys_ptrace(dword_t request, dword_t pid, addr_t addr, addr_t data) {
 
             struct user_fpregs_struct_ user_fpregs_;
             if (user_get(data, user_fpregs_)) {
+                unlock(&child->ptrace.lock);
                 return _EFAULT;
             } else {
                 // TODO set floating point registers
@@ -259,6 +267,7 @@ dword_t sys_ptrace(dword_t request, dword_t pid, addr_t addr, addr_t data) {
             if (!child) return _EPERM;
 
             if (data && user_put(data, child->ptrace.info)) {
+                unlock(&child->ptrace.lock);
                 return _EFAULT;
             }
             unlock(&child->ptrace.lock);
