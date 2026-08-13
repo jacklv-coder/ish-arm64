@@ -13,6 +13,7 @@ struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data
     timer->active = false;
     timer->thread_running = false;
     lock_init(&timer->lock);
+    cond_init(&timer->finished);
     timer->dead = false;
     return timer;
 }
@@ -26,8 +27,25 @@ void timer_free(struct timer *timer) {
         unlock(&timer->lock);
     } else {
         unlock(&timer->lock);
+        cond_destroy(&timer->finished);
         free(timer);
     }
+}
+
+void timer_free_sync(struct timer *timer) {
+    lock(&timer->lock);
+    timer->active = false;
+    if (timer->thread_running) {
+        pthread_kill(timer->thread, SIGUSR1);
+        // The callback executes with timer->lock held. Acquiring the lock above
+        // therefore waits for an in-flight callback, and this condition waits
+        // for the detached timer pthread to stop touching timer storage.
+        while (timer->thread_running)
+            wait_for_ignore_signals(&timer->finished, &timer->lock, NULL);
+    }
+    unlock(&timer->lock);
+    cond_destroy(&timer->finished);
+    free(timer);
 }
 
 static void *timer_thread(void *param) {
@@ -51,10 +69,14 @@ static void *timer_thread(void *param) {
         }
     }
     timer->thread_running = false;
-    if (timer->dead)
-        free(timer);
-    else
+    notify(&timer->finished);
+    if (timer->dead) {
         unlock(&timer->lock);
+        cond_destroy(&timer->finished);
+        free(timer);
+    } else {
+        unlock(&timer->lock);
+    }
     return NULL;
 }
 

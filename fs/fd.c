@@ -7,6 +7,8 @@
 #include "fs/poll.h"
 #include "fs/fd.h"
 #include "fs/inode.h"
+#include "fs/real.h"
+#include "fs/sock.h"
 
 struct fd *fd_create(const struct fd_ops *ops) {
     struct fd *fd = malloc(sizeof(struct fd));
@@ -72,6 +74,21 @@ struct fdtable *fdtable_new(int size) {
 }
 
 static int fdtable_close(struct fdtable *table, fd_t f);
+
+void fdtable_shutdown_exclusive(struct fdtable *table) {
+    lock(&table->lock);
+    for (fd_t f = 0; (unsigned) f < table->size; f++) {
+        struct fd *fd = table->files[f];
+        if (fd == NULL || atomic_load(&fd->refcount) != 1 ||
+                (fd->ops->close != realfs_close &&
+                 fd->ops != &socket_fdops))
+            continue;
+        int real_fd = atomic_exchange(&fd->real_fd, -1);
+        if (real_fd >= 0)
+            close(real_fd);
+    }
+    unlock(&table->lock);
+}
 
 // FIXME this looks like it has the classic refcount UAF
 void fdtable_release(struct fdtable *table) {
@@ -195,7 +212,9 @@ fd_t f_install(struct fd *fd, int flags) {
 }
 
 static int fdtable_close(struct fdtable *table, fd_t f) {
-    struct fd *fd = fdtable_get(table, f);
+    if (f < 0 || (unsigned) f >= table->size)
+        return _EBADF;
+    struct fd *fd = table->files[f];
     if (fd == NULL)
         return _EBADF;
     if (fd->inode != NULL) // temporary hack for files like sockets that right now don't have inodes but will eventually

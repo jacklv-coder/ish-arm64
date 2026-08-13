@@ -62,12 +62,15 @@ struct timer {
     timer_callback_t callback;
     void *data;
     lock_t lock;
-
-    bool dead; // set by timer_free, the thread will free the timer if this is set when it finishes
+    cond_t finished;
+    bool dead; // asynchronous timer_free lets the timer thread own destruction
 };
 
 struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data);
 void timer_free(struct timer *timer);
+// Stops the timer and waits until an in-flight callback and the detached timer
+// pthread no longer access timer or callback data.
+void timer_free_sync(struct timer *timer);
 // value is how long to wait until the next fire
 // interval is how long after that to wait until the next fire (if non-zero)
 // bizarre interface is based off setitimer, because this is going to be used

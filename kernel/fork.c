@@ -43,6 +43,12 @@
 #define IMPLEMENTED_FLAGS (CLONE_VM_|CLONE_FILES_|CLONE_FS_|CLONE_SIGHAND_|CLONE_SYSVSEM_|CLONE_VFORK_|CLONE_THREAD_|\
         CLONE_SETTLS_|CLONE_CHILD_SETTID_|CLONE_PARENT_SETTID_|CLONE_CHILD_CLEARTID_|CLONE_DETACHED_)
 
+void tgroup_reset_exit_state_after_copy(struct tgroup *group) {
+    group->doing_group_exit = false;
+    group->force_detached_count = 0;
+    group->reap_deferred = false;
+}
+
 static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
     *group = *old_group;
@@ -55,7 +61,7 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
         unlock(&group->tty->lock);
     }
     group->itimer = NULL;
-    group->doing_group_exit = false;
+    tgroup_reset_exit_state_after_copy(group);
     group->children_rusage = (struct rusage_) {};
     {
         struct timespec _ts;
@@ -113,6 +119,15 @@ static int copy_task(struct task *task, dword_t flags, addr_t stack, addr_t ptid
     struct tgroup *old_group = task->group;
     lock(&pids_lock);
     lock(&old_group->lock);
+    // Do not publish a child into a group whose teardown snapshot has already
+    // started. In particular, a force-detached parent may have entered clone
+    // before the snapshot and reached this point afterward.
+    if (old_group->doing_group_exit || current->force_detached) {
+        unlock(&old_group->lock);
+        unlock(&pids_lock);
+        err = _EINTR;
+        goto fail_free_sighand;
+    }
     if (!(flags & CLONE_THREAD_)) {
         task->group = tgroup_copy(old_group);
         task->group->leader = task;
@@ -210,9 +225,6 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
             // FIXME this should stop waiting if a fatal signal is received
             wait_for_ignore_signals(&vfork.cond, &vfork.lock, NULL);
         unlock(&vfork.lock);
-        lock(&task->general_lock);
-        task->vfork = NULL;
-        unlock(&task->general_lock);
         cond_destroy(&vfork.cond);
     }
 
@@ -229,11 +241,16 @@ dword_t sys_vfork() {
 
 void vfork_notify(struct task *task) {
     lock(&task->general_lock);
-    if (task->vfork) {
-        lock(&task->vfork->lock);
-        task->vfork->done = true;
-        notify(&task->vfork->cond);
-        unlock(&task->vfork->lock);
+    struct vfork_info *vfork = task->vfork;
+    if (vfork != NULL) {
+        lock(&vfork->lock);
+        // Complete the task-side handoff before waking the parent. The parent
+        // owns `vfork` on its stack and must not touch `task` after it wakes:
+        // force-detached cleanup may dispose the task immediately afterward.
+        task->vfork = NULL;
+        vfork->done = true;
+        notify(&vfork->cond);
+        unlock(&vfork->lock);
     }
     unlock(&task->general_lock);
 }
