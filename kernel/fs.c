@@ -978,10 +978,14 @@ dword_t sys_chdir(addr_t path_addr) {
 
 dword_t sys_fchdir(fd_t f) {
     STRACE("fchdir(%d)", f);
-    struct fd *dir = f_get(f);
+    struct fdtable *table = current->files;
+    lock(&table->lock);
+    struct fd *dir = fdtable_get(table, f);
+    if (dir != NULL)
+        fd_retain(dir);
+    unlock(&table->lock);
     if (dir == NULL)
         return _EBADF;
-    dir->refcount++;
     fs_chdir(current->fs, dir);
     return 0;
 }

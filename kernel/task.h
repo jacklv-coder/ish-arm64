@@ -139,10 +139,6 @@ void task_unpublish_locked(struct task *task);
 // Invalidates already-unpublished task storage and queues it for deferred free.
 // Must be called with pids_lock held.
 void task_dispose_locked(struct task *task);
-// Returns true if every published owner of task->files belongs to task's
-// exiting thread group. Must be called with pids_lock held.
-bool task_fdtable_is_group_private_locked(struct task *task);
-
 // Removes a host thread that did not respond to group exit from the visible
 // thread-group state. Must be called with pids_lock and task->group->lock held.
 // Resource ownership is intentionally part of this boundary so the forced

@@ -14,6 +14,10 @@
 
 struct fd {
     atomic_uint refcount;
+    // References owned by descriptor tables whose tasks were all forcibly
+    // detached. When this reaches refcount, no live external owner remains.
+    unsigned force_shutdown_refs;
+    lock_t refcount_lock;
     unsigned flags;
     mode_t_ type; // just the S_IFMT part, it can't change
     const struct fd_ops *ops;
@@ -171,17 +175,25 @@ struct fd_ops {
 
 struct fdtable {
     atomic_uint refcount;
+    // References owned by force-detached tasks. Protected by lock. When every
+    // remaining owner is deferred, host handles can be closed to wake them.
+    unsigned force_detached_refs;
+    // Prevent repeated descriptor scans as deferred owners finish. Protected
+    // by lock and set only after a complete shutdown pass.
+    bool force_shutdown_complete;
     unsigned size;
     struct fd **files;
     bits_t *cloexec;
+    // Slots whose fd references were registered by the forced-shutdown scan.
+    // A syscall may still install new descriptors after that snapshot.
+    bits_t *force_shutdown;
     lock_t lock;
 };
 
 struct fdtable *fdtable_new(int size);
 void fdtable_release(struct fdtable *table);
-// Closes host-backed descriptors that are owned only by this table, without
-// freeing fd objects that a blocked syscall may still borrow.
-void fdtable_shutdown_exclusive(struct fdtable *table);
+void fdtable_mark_force_detached(struct fdtable *table);
+void fdtable_release_force_detached(struct fdtable *table);
 struct fdtable *fdtable_copy(struct fdtable *table);
 void fdtable_free(struct fdtable *table);
 void fdtable_do_cloexec(struct fdtable *table);

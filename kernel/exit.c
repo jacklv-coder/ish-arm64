@@ -122,10 +122,11 @@ bool task_force_detach_for_group_exit_locked(struct task *task) {
     if (!task_is_leader(task))
         task_unpublish_locked(task);
 
-    // Only close host handles when the table and each fd object are exclusive.
-    // Otherwise delayed final release remains the safe fallback.
-    if (task_fdtable_is_group_private_locked(task) && task->files != NULL)
-        fdtable_shutdown_exclusive(task->files);
+    // Register this reference as deferred. The fdtable closes its host handles
+    // once every remaining owner is force-detached (or the last runnable owner
+    // releases it), waking blocked syscalls without disrupting a live owner.
+    if (task->files != NULL)
+        fdtable_mark_force_detached(task->files);
 
     // The group lock is part of this function's caller contract. Do not wait
     // for the timer callback while holding it: send_signal(SIGKILL) takes the
@@ -179,7 +180,10 @@ static void task_release_runtime_resources(struct task *task) {
     unlock(&task->general_lock);
     task_release_futex_pipe(task);
     if (task->files != NULL) {
-        fdtable_release(task->files);
+        if (atomic_load(&task->force_detached))
+            fdtable_release_force_detached(task->files);
+        else
+            fdtable_release(task->files);
         task->files = NULL;
     }
     if (task->fs != NULL) {
