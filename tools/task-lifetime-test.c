@@ -634,14 +634,19 @@ static void test_force_detach_preserves_fd_shared_by_copied_table(void) {
     assert(write(atomic_load(&writer->real_fd), &value, 1) == 1);
     char received = 0;
     assert(read(shared_pipe[0], &received, 1) == 1 && received == value);
+    // Releasing the copied table removes the last live reference. The host
+    // handle must close immediately even though the deferred task has not yet
+    // returned to release its original table.
+    fdtable_release(external->files);
+    external->files = NULL;
+    assert(atomic_load(&writer->real_fd) == -1);
+    assert(read(shared_pipe[0], &received, 1) == 0);
     close(shared_pipe[0]);
 
     pthread_t worker;
     assert(pthread_create(&worker, NULL, finish_detached_guest_exit, task) == 0);
     assert(pthread_join(worker, NULL) == 0);
 
-    fdtable_release(external->files);
-    external->files = NULL;
     list_remove(&external->group_links);
     lock(&pids_lock);
     task_destroy(external);
@@ -691,6 +696,109 @@ static void test_force_detach_shuts_down_private_socket(void) {
 
     char byte;
     assert(read(sockets[1], &byte, sizeof(byte)) == 0);
+    close(sockets[1]);
+
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL, finish_detached_guest_exit, task) == 0);
+    assert(pthread_join(worker, NULL) == 0);
+
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
+static void test_force_detach_treats_late_installed_fd_as_live(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+    task->files = fdtable_new(2);
+    assert(!IS_ERR(task->files));
+
+    int first_pipe[2];
+    int late_pipe[2];
+    assert(pipe(first_pipe) == 0);
+    assert(pipe(late_pipe) == 0);
+    struct fd *first = fd_create(&realfs_fdops);
+    struct fd *late = fd_create(&realfs_fdops);
+    assert(first != NULL && late != NULL);
+    first->real_fd = first_pipe[1];
+    late->real_fd = late_pipe[1];
+    task->files->files[0] = first;
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    assert(atomic_load(&first->real_fd) == -1);
+    // Model accept/open/SCM_RIGHTS finishing after the shutdown snapshot.
+    task->files->files[1] = late;
+    assert(!bit_test(1, task->files->force_shutdown));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL, finish_detached_guest_exit, task) == 0);
+    assert(pthread_join(worker, NULL) == 0);
+    assert(read(first_pipe[0], &(char) {0}, 1) == 0);
+    assert(read(late_pipe[0], &(char) {0}, 1) == 0);
+    close(first_pipe[0]);
+    close(late_pipe[0]);
+
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
+static void test_force_detach_consumes_marker_on_inflight_close(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+    task->files = fdtable_new(1);
+    assert(!IS_ERR(task->files));
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct fd *socket_fd = fd_create(&socket_fdops);
+    assert(socket_fd != NULL);
+    socket_fd->real_fd = sockets[0];
+    socket_fd->socket.domain = AF_INET_;
+    task->files->files[0] = socket_fd;
+
+    current = task;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    assert(bit_test(0, task->files->force_shutdown));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    // Model an in-flight syscall completing a guest close after detachment.
+    assert(f_close(0) == 0);
+    assert(task->files->files[0] == NULL);
+    assert(!bit_test(0, task->files->force_shutdown));
+    assert(read(sockets[1], &(char) {0}, 1) == 0);
     close(sockets[1]);
 
     pthread_t worker;
@@ -1011,6 +1119,8 @@ int main(void) {
     test_force_detach_preserves_externally_shared_fdtable();
     test_force_detach_preserves_fd_shared_by_copied_table();
     test_force_detach_shuts_down_private_socket();
+    test_force_detach_treats_late_installed_fd_as_live();
+    test_force_detach_consumes_marker_on_inflight_close();
     test_force_detach_shuts_down_duplicated_private_socket();
     test_force_detach_preserves_same_group_shared_fdtable();
     test_force_detach_closes_table_after_every_owner_detaches();

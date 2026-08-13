@@ -17,6 +17,8 @@ struct fd *fd_create(const struct fd_ops *ops) {
     *fd = (struct fd) {};
     fd->ops = ops;
     fd->refcount = 1;
+    fd->force_shutdown_refs = 0;
+    lock_init(&fd->refcount_lock);
     fd->flags = 0;
     fd->mount = NULL;
     fd->offset = 0;
@@ -28,13 +30,50 @@ struct fd *fd_create(const struct fd_ops *ops) {
 }
 
 struct fd *fd_retain(struct fd *fd) {
+    lock(&fd->refcount_lock);
+    assert(atomic_load(&fd->refcount) > 0);
     fd->refcount++;
+    unlock(&fd->refcount_lock);
     return fd;
 }
 
-int fd_close(struct fd *fd) {
+static bool fd_supports_force_shutdown(struct fd *fd) {
+    return fd->ops != NULL &&
+        (fd->ops->close == realfs_close || fd->ops == &socket_fdops);
+}
+
+static void fd_mark_force_shutdown(struct fd *fd, unsigned references) {
+    lock(&fd->refcount_lock);
+    fd->force_shutdown_refs += references;
+    assert(fd->force_shutdown_refs <= atomic_load(&fd->refcount));
+    bool should_shutdown = fd_supports_force_shutdown(fd) &&
+        fd->force_shutdown_refs == atomic_load(&fd->refcount);
+    int real_fd = should_shutdown ? atomic_exchange(&fd->real_fd, -1) : -1;
+    unlock(&fd->refcount_lock);
+    if (real_fd >= 0)
+        close(real_fd);
+}
+
+static int fd_close_internal(struct fd *fd, bool force_shutdown_reference) {
     int err = 0;
-    if (--fd->refcount == 0) {
+    bool deferred = force_shutdown_reference &&
+        fd_supports_force_shutdown(fd);
+    lock(&fd->refcount_lock);
+    if (deferred) {
+        assert(fd->force_shutdown_refs > 0);
+        fd->force_shutdown_refs--;
+    }
+    unsigned references = atomic_fetch_sub(&fd->refcount, 1) - 1;
+    assert(references != 0 || fd->force_shutdown_refs == 0);
+    bool should_shutdown = references != 0 &&
+        fd->force_shutdown_refs == references &&
+        fd_supports_force_shutdown(fd);
+    int real_fd = should_shutdown ? atomic_exchange(&fd->real_fd, -1) : -1;
+    unlock(&fd->refcount_lock);
+
+    if (real_fd >= 0)
+        close(real_fd);
+    if (references == 0) {
         poll_cleanup_fd(fd);
         if (fd->ops->close)
             err = fd->ops->close(fd);
@@ -54,6 +93,10 @@ int fd_close(struct fd *fd) {
     return err;
 }
 
+int fd_close(struct fd *fd) {
+    return fd_close_internal(fd, false);
+}
+
 static int fdtable_resize(struct fdtable *table, unsigned size);
 
 struct fdtable *fdtable_new(int size) {
@@ -66,6 +109,7 @@ struct fdtable *fdtable_new(int size) {
     fdt->size = 0;
     fdt->files = NULL;
     fdt->cloexec = NULL;
+    fdt->force_shutdown = NULL;
     lock_init(&fdt->lock);
     int err = fdtable_resize(fdt, size);
     if (err < 0) {
@@ -87,8 +131,7 @@ static void fdtable_shutdown_exclusive_without_storage_locked(
         struct fdtable *table) {
     for (fd_t f = 0; (unsigned) f < table->size; f++) {
         struct fd *fd = table->files[f];
-        if (fd == NULL || (fd->ops->close != realfs_close &&
-                           fd->ops != &socket_fdops))
+        if (fd == NULL || !fd_supports_force_shutdown(fd))
             continue;
 
         bool already_counted = false;
@@ -106,11 +149,11 @@ static void fdtable_shutdown_exclusive_without_storage_locked(
             if (table->files[later] == fd)
                 table_refs++;
         }
-        if (atomic_load(&fd->refcount) != table_refs)
-            continue;
-        int real_fd = atomic_exchange(&fd->real_fd, -1);
-        if (real_fd >= 0)
-            close(real_fd);
+        fd_mark_force_shutdown(fd, table_refs);
+        for (fd_t slot = f; (unsigned) slot < table->size; slot++) {
+            if (table->files[slot] == fd)
+                bit_set(slot, table->force_shutdown);
+        }
     }
 }
 
@@ -131,10 +174,10 @@ static void fdtable_shutdown_exclusive_locked(struct fdtable *table) {
     unsigned owned_count = 0;
     for (fd_t f = 0; (unsigned) f < table->size; f++) {
         struct fd *fd = table->files[f];
-        if (fd == NULL || (fd->ops->close != realfs_close &&
-                           fd->ops != &socket_fdops))
+        if (fd == NULL || !fd_supports_force_shutdown(fd))
             continue;
         owned[owned_count++] = fd;
+        bit_set(f, table->force_shutdown);
     }
 
     // Count aliases in one sorted pass. A table can contain thousands of
@@ -147,15 +190,10 @@ static void fdtable_shutdown_exclusive_locked(struct fdtable *table) {
         while (after < owned_count && owned[after] == fd)
             after++;
 
-        // Keep the host handle open when an fd object is also retained outside
-        // this table (for example by mmap, poll, or a copied descriptor table).
-        if (atomic_load(&fd->refcount) != after - first) {
-            first = after;
-            continue;
-        }
-        int real_fd = atomic_exchange(&fd->real_fd, -1);
-        if (real_fd >= 0)
-            close(real_fd);
+        // External refs (mmap, poll, or a copied descriptor table) keep the
+        // host handle open. Their final release closes it when only deferred
+        // aliases remain.
+        fd_mark_force_shutdown(fd, after - first);
         first = after;
     }
     free(owned);
@@ -180,6 +218,7 @@ void fdtable_release(struct fdtable *table) {
             fdtable_close(table, f);
         free(table->files);
         free(table->cloexec);
+        free(table->force_shutdown);
         unlock(&table->lock);
         free(table);
     } else {
@@ -201,6 +240,7 @@ void fdtable_release_force_detached(struct fdtable *table) {
             fdtable_close(table, f);
         free(table->files);
         free(table->cloexec);
+        free(table->force_shutdown);
         unlock(&table->lock);
         free(table);
     } else {
@@ -230,10 +270,23 @@ static int fdtable_resize(struct fdtable *table, unsigned size) {
     if (table->cloexec)
         memcpy(cloexec, table->cloexec, BITS_SIZE(table->size));
 
+    bits_t *force_shutdown = malloc(BITS_SIZE(size));
+    if (force_shutdown == NULL) {
+        free(files);
+        free(cloexec);
+        return _ENOMEM;
+    }
+    memset(force_shutdown, 0, BITS_SIZE(size));
+    if (table->force_shutdown)
+        memcpy(force_shutdown, table->force_shutdown,
+            BITS_SIZE(table->size));
+
     free(table->files);
     table->files = files;
     free(table->cloexec);
     table->cloexec = cloexec;
+    free(table->force_shutdown);
+    table->force_shutdown = force_shutdown;
     table->size = size;
     return 0;
 }
@@ -249,7 +302,7 @@ struct fdtable *fdtable_copy(struct fdtable *table) {
     memcpy(new_table->files, table->files, sizeof(struct fd *) * size);
     for (fd_t f = 0; f < size; f++)
         if (new_table->files[f])
-            new_table->files[f]->refcount++;
+            fd_retain(new_table->files[f]);
     memcpy(new_table->cloexec, table->cloexec, BITS_SIZE(size));
     unlock(&table->lock);
     return new_table;
@@ -297,6 +350,7 @@ static fd_t f_install_start(struct fd *fd, fd_t start) {
     if (f >= 0) {
         table->files[f] = fd;
         bit_clear(f, table->cloexec);
+        bit_clear(f, table->force_shutdown);
     } else {
         fd_close(fd);
     }
@@ -324,9 +378,10 @@ static int fdtable_close(struct fdtable *table, fd_t f) {
         return _EBADF;
     if (fd->inode != NULL) // temporary hack for files like sockets that right now don't have inodes but will eventually
         file_lock_remove_owned_by(fd, table);
-    int err = fd_close(fd);
+    int err = fd_close_internal(fd, bit_test(f, table->force_shutdown));
     table->files[f] = NULL;
     bit_clear(f, table->cloexec);
+    bit_clear(f, table->force_shutdown);
     return err;
 }
 
@@ -372,14 +427,7 @@ dword_t sys_close_range(dword_t first, dword_t last, dword_t flags) {
         if (flags & CLOSE_RANGE_CLOEXEC_) {
             bit_set(f, table->cloexec);
         } else {
-            // Inline what fdtable_close does so we don't drop the
-            // table lock between iterations.
-            struct fd *sfd = table->files[f];
-            table->files[f] = NULL;
-            bit_clear(f, table->cloexec);
-            unlock(&table->lock);
-            fd_close(sfd);
-            lock(&table->lock);
+            fdtable_close(table, f);
         }
     }
     unlock(&table->lock);
@@ -418,28 +466,47 @@ void fdtable_do_cloexec(struct fdtable *table) {
 
 dword_t sys_dup(fd_t f) {
     STRACE("dup(%d)", f);
-    struct fd *fd = f_get(f);
-    if (fd == NULL)
+    struct fdtable *table = current->files;
+    lock(&table->lock);
+    struct fd *fd = fdtable_get(table, f);
+    if (fd == NULL) {
+        unlock(&table->lock);
         return _EBADF;
-    fd->refcount++;
-    return f_install(fd, 0);
+    }
+    fd_retain(fd);
+    fd_t new_f = f_install_start(fd, 0);
+    unlock(&table->lock);
+    return new_f;
 }
 
 dword_t sys_dup3(fd_t f, fd_t new_f, int_t flags) {
     STRACE("dup3(%d, %d, %d)", f, new_f, flags);
     struct fdtable *table = current->files;
-    struct fd *fd = f_get(f);
+    lock(&table->lock);
+    struct fd *fd = fdtable_get(table, f);
     if (fd == NULL)
-        return _EBADF;
+        goto bad_fd;
+    if (f == new_f) {
+        unlock(&table->lock);
+        return new_f;
+    }
     int err = fdtable_expand(table, new_f);
-    if (err < 0)
+    if (err < 0) {
+        unlock(&table->lock);
         return err;
+    }
     fd_retain(fd);
-    f_close(new_f);
+    fdtable_close(table, new_f);
     table->files[new_f] = fd;
+    bit_clear(new_f, table->force_shutdown);
     if (flags & O_CLOEXEC_)
         bit_set(new_f, table->cloexec);
+    unlock(&table->lock);
     return new_f;
+
+bad_fd:
+    unlock(&table->lock);
+    return _EBADF;
 }
 
 dword_t sys_dup2(fd_t f, fd_t new_f) {
@@ -462,26 +529,30 @@ int fd_setflags(struct fd *fd, int flags) {
 
 dword_t sys_fcntl(fd_t f, dword_t cmd, addr_t arg) {
     struct fdtable *table = current->files;
+    if (cmd == F_DUPFD_ || cmd == F_DUPFD_CLOEXEC_) {
+        STRACE("fcntl(%d, %s, %d)", f,
+            cmd == F_DUPFD_ ? "F_DUPFD" : "F_DUPFD_CLOEXEC", arg);
+        lock(&table->lock);
+        struct fd *duplicate = fdtable_get(table, f);
+        if (duplicate == NULL) {
+            unlock(&table->lock);
+            return _EBADF;
+        }
+        fd_retain(duplicate);
+        fd_t installed = f_install_start(duplicate, arg);
+        if (installed >= 0 && cmd == F_DUPFD_CLOEXEC_)
+            bit_set(installed, table->cloexec);
+        unlock(&table->lock);
+        return installed;
+    }
+
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
     struct flock32_ flock32;
     struct flock_ flock;
-    fd_t new_f;
     int err;
     switch (cmd) {
-        case F_DUPFD_:
-            STRACE("fcntl(%d, F_DUPFD, %d)", f, arg);
-            fd->refcount++;
-            return f_install_start(fd, arg);
-
-        case F_DUPFD_CLOEXEC_:
-            STRACE("fcntl(%d, F_DUPFD_CLOEXEC, %d)", f, arg);
-            fd->refcount++;
-            new_f = f_install_start(fd, arg);
-            bit_set(new_f, table->cloexec);
-            return new_f;
-
         case F_GETFD_:
             STRACE("fcntl(%d, F_GETFD)", f);
             return bit_test(f, table->cloexec);

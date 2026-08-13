@@ -14,6 +14,10 @@
 
 struct fd {
     atomic_uint refcount;
+    // References owned by descriptor tables whose tasks were all forcibly
+    // detached. When this reaches refcount, no live external owner remains.
+    unsigned force_shutdown_refs;
+    lock_t refcount_lock;
     unsigned flags;
     mode_t_ type; // just the S_IFMT part, it can't change
     const struct fd_ops *ops;
@@ -180,6 +184,9 @@ struct fdtable {
     unsigned size;
     struct fd **files;
     bits_t *cloexec;
+    // Slots whose fd references were registered by the forced-shutdown scan.
+    // A syscall may still install new descriptors after that snapshot.
+    bits_t *force_shutdown;
     lock_t lock;
 };
 
