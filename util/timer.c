@@ -21,6 +21,9 @@ struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data
     timer->data = data;
     timer->active = false;
     timer->thread_running = false;
+    timer->start = (struct timespec) {};
+    timer->end = (struct timespec) {};
+    timer->interval = (struct timespec) {};
     lock_init(&timer->lock);
     cond_init(&timer->finished);
     timer->dead = false;
@@ -92,6 +95,10 @@ static void *timer_thread(void *param) {
 int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *oldspec) {
     lock(&timer->lock);
     struct timespec now = timespec_now(timer->clockid);
+    struct timespec previous_start = timer->start;
+    struct timespec previous_end = timer->end;
+    struct timespec previous_interval = timer->interval;
+    bool previous_active = timer->active;
     if (oldspec != NULL) {
         oldspec->value = timespec_subtract(timer->end, now);
         oldspec->interval = timer->interval;
@@ -109,7 +116,10 @@ int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *ol
                 timer);
         if (create_error != 0) {
             timer->thread_running = false;
-            timer->active = false;
+            timer->start = previous_start;
+            timer->end = previous_end;
+            timer->interval = previous_interval;
+            timer->active = previous_active;
             unlock(&timer->lock);
             errno = create_error;
             return errno_map();

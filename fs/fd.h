@@ -179,8 +179,10 @@ struct fdtable {
     // remaining owner is deferred, host handles can be closed to wake them.
     unsigned force_detached_refs;
     // Force-detached owners that could not allocate a per-descriptor snapshot.
-    // While nonzero, close/replace fails closed so an in-flight borrowed fd
-    // cannot be freed. Protected by lock.
+    // While nonzero, installs/copies are frozen and closed slots remain as
+    // hidden tombstones until the table itself is destroyed. The table's own
+    // slot reference pins any in-flight borrow held by a shared owner.
+    // Protected by lock.
     unsigned unsnapshotted_force_detached_refs;
     // Prevent repeated descriptor scans as deferred owners finish. Protected
     // by lock and set only after a complete shutdown pass.
@@ -191,6 +193,7 @@ struct fdtable {
     // Slots whose fd references were registered by the forced-shutdown scan.
     // A syscall may still install new descriptors after that snapshot.
     bits_t *force_shutdown;
+    bits_t *force_detach_closed;
     lock_t lock;
 };
 

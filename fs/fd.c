@@ -116,6 +116,7 @@ struct fdtable *fdtable_new(int size) {
     fdt->files = NULL;
     fdt->cloexec = NULL;
     fdt->force_shutdown = NULL;
+    fdt->force_detach_closed = NULL;
     lock_init(&fdt->lock);
     int err = fdtable_resize(fdt, size);
     if (err < 0) {
@@ -127,6 +128,28 @@ struct fdtable *fdtable_new(int size) {
 
 static int fdtable_close(struct fdtable *table, fd_t f);
 
+static void fdtable_destroy_locked(struct fdtable *table) {
+    for (fd_t f = 0; (unsigned) f < table->size; f++) {
+        if (bit_test(f, table->force_detach_closed)) {
+            struct fd *fd = table->files[f];
+            if (fd != NULL)
+                fd_close_internal(fd, bit_test(f, table->force_shutdown));
+            table->files[f] = NULL;
+            bit_clear(f, table->force_detach_closed);
+            bit_clear(f, table->cloexec);
+            bit_clear(f, table->force_shutdown);
+        } else {
+            fdtable_close(table, f);
+        }
+    }
+    free(table->files);
+    free(table->cloexec);
+    free(table->force_shutdown);
+    free(table->force_detach_closed);
+    unlock(&table->lock);
+    free(table);
+}
+
 static int fd_pointer_compare(const void *left, const void *right) {
     uintptr_t left_value = (uintptr_t) *(struct fd *const *) left;
     uintptr_t right_value = (uintptr_t) *(struct fd *const *) right;
@@ -137,12 +160,14 @@ static void fdtable_shutdown_exclusive_without_storage_locked(
         struct fdtable *table) {
     for (fd_t f = 0; (unsigned) f < table->size; f++) {
         struct fd *fd = table->files[f];
-        if (fd == NULL || !fd_supports_force_shutdown(fd))
+        if (fd == NULL || bit_test(f, table->force_detach_closed) ||
+                !fd_supports_force_shutdown(fd))
             continue;
 
         bool already_counted = false;
         for (fd_t earlier = 0; earlier < f; earlier++) {
-            if (table->files[earlier] == fd) {
+            if (!bit_test(earlier, table->force_detach_closed) &&
+                    table->files[earlier] == fd) {
                 already_counted = true;
                 break;
             }
@@ -152,12 +177,14 @@ static void fdtable_shutdown_exclusive_without_storage_locked(
 
         unsigned table_refs = 1;
         for (fd_t later = f + 1; (unsigned) later < table->size; later++) {
-            if (table->files[later] == fd)
+            if (!bit_test(later, table->force_detach_closed) &&
+                    table->files[later] == fd)
                 table_refs++;
         }
         fd_mark_force_shutdown(fd, table_refs);
         for (fd_t slot = f; (unsigned) slot < table->size; slot++) {
-            if (table->files[slot] == fd)
+            if (!bit_test(slot, table->force_detach_closed) &&
+                    table->files[slot] == fd)
                 bit_set(slot, table->force_shutdown);
         }
     }
@@ -180,7 +207,8 @@ static void fdtable_shutdown_exclusive_locked(struct fdtable *table) {
     unsigned owned_count = 0;
     for (fd_t f = 0; (unsigned) f < table->size; f++) {
         struct fd *fd = table->files[f];
-        if (fd == NULL || !fd_supports_force_shutdown(fd))
+        if (fd == NULL || bit_test(f, table->force_detach_closed) ||
+                !fd_supports_force_shutdown(fd))
             continue;
         owned[owned_count++] = fd;
         bit_set(f, table->force_shutdown);
@@ -238,8 +266,9 @@ void fdtable_commit_force_detach_locked(struct fdtable *table,
         struct fdtable_force_detach *snapshot) {
     if (snapshot == NULL) {
         // Allocation failure must not disable group-exit's safety valve. Keep
-        // the table slots stable until this host pthread leaves its in-flight
-        // syscall; close/dup replacement returns EBUSY in the meantime.
+        // the table's existing slot references in place. Close can still hide
+        // a slot and wake its host syscall, but installs/copies remain frozen
+        // until every allocation-free detached pthread returns.
         table->unsnapshotted_force_detached_refs++;
     } else {
         assert(table->size <= snapshot->capacity);
@@ -267,13 +296,7 @@ void fdtable_release(struct fdtable *table) {
     lock(&table->lock);
     if (--table->refcount == 0) {
         assert(table->force_detached_refs == 0);
-        for (fd_t f = 0; (unsigned) f < table->size; f++)
-            fdtable_close(table, f);
-        free(table->files);
-        free(table->cloexec);
-        free(table->force_shutdown);
-        unlock(&table->lock);
-        free(table);
+        fdtable_destroy_locked(table);
     } else {
         // The last runnable owner just exited. Closing host handles now wakes
         // every force-detached owner still blocked in a host syscall.
@@ -297,13 +320,7 @@ void fdtable_release_force_detached(struct fdtable *table,
     table->force_detached_refs--;
     if (--table->refcount == 0) {
         assert(table->force_detached_refs == 0);
-        for (fd_t f = 0; (unsigned) f < table->size; f++)
-            fdtable_close(table, f);
-        free(table->files);
-        free(table->cloexec);
-        free(table->force_shutdown);
-        unlock(&table->lock);
-        free(table);
+        fdtable_destroy_locked(table);
     } else {
         if (table->force_detached_refs == atomic_load(&table->refcount))
             fdtable_shutdown_exclusive_locked(table);
@@ -342,28 +359,47 @@ static int fdtable_resize(struct fdtable *table, unsigned size) {
         memcpy(force_shutdown, table->force_shutdown,
             BITS_SIZE(table->size));
 
+    bits_t *force_detach_closed = malloc(BITS_SIZE(size));
+    if (force_detach_closed == NULL) {
+        free(files);
+        free(cloexec);
+        free(force_shutdown);
+        return _ENOMEM;
+    }
+    memset(force_detach_closed, 0, BITS_SIZE(size));
+    if (table->force_detach_closed)
+        memcpy(force_detach_closed, table->force_detach_closed,
+            BITS_SIZE(table->size));
+
     free(table->files);
     table->files = files;
     free(table->cloexec);
     table->cloexec = cloexec;
     free(table->force_shutdown);
     table->force_shutdown = force_shutdown;
+    free(table->force_detach_closed);
+    table->force_detach_closed = force_detach_closed;
     table->size = size;
     return 0;
 }
 
 struct fdtable *fdtable_copy(struct fdtable *table) {
     lock(&table->lock);
+    if (table->unsnapshotted_force_detached_refs != 0) {
+        unlock(&table->lock);
+        return ERR_PTR(_EBUSY);
+    }
     int size = table->size;
     struct fdtable *new_table = fdtable_new(size);
     if (IS_ERR(new_table)) {
         unlock(&table->lock);
         return new_table;
     }
-    memcpy(new_table->files, table->files, sizeof(struct fd *) * size);
-    for (fd_t f = 0; f < size; f++)
-        if (new_table->files[f])
-            fd_retain(new_table->files[f]);
+    for (fd_t f = 0; f < size; f++) {
+        struct fd *fd = fdtable_get(table, f);
+        if (fd != NULL)
+            new_table->files[f] = fd_retain(fd);
+    }
     memcpy(new_table->cloexec, table->cloexec, BITS_SIZE(size));
     unlock(&table->lock);
     return new_table;
@@ -380,7 +416,8 @@ static int fdtable_expand(struct fdtable *table, fd_t max,
 }
 
 struct fd *fdtable_get(struct fdtable *table, fd_t f) {
-    if (f < 0 || (unsigned) f >= current->files->size)
+    if (f < 0 || (unsigned) f >= table->size ||
+            bit_test(f, table->force_detach_closed))
         return NULL;
     return table->files[f];
 }
@@ -396,6 +433,10 @@ static fd_t f_install_start(struct fd *fd, fd_t start,
         rlim_t_ nofile_limit) {
     assert(start >= 0);
     struct fdtable *table = current->files;
+    if (table->unsnapshotted_force_detached_refs != 0) {
+        fd_close(fd);
+        return _EBUSY;
+    }
     rlim_t_ size = nofile_limit;
     if (size > table->size)
         size = table->size;
@@ -438,12 +479,25 @@ static int fdtable_close(struct fdtable *table, fd_t f) {
     if (f < 0 || (unsigned) f >= table->size)
         return _EBADF;
     struct fd *fd = table->files[f];
-    if (fd == NULL)
+    if (fd == NULL || bit_test(f, table->force_detach_closed))
         return _EBADF;
-    if (table->unsnapshotted_force_detached_refs != 0)
-        return _EBUSY;
     if (fd->inode != NULL) // temporary hack for files like sockets that right now don't have inodes but will eventually
         file_lock_remove_owned_by(fd, table);
+    if (table->unsnapshotted_force_detached_refs != 0) {
+        // Convert the table's visible reference into a hidden tombstone. Keep
+        // that reference until the table itself is destroyed: other shared
+        // owners may already have borrowed the descriptor through f_get().
+        // Marking the reference as force-shutdown still closes the host handle
+        // once no runnable/copy-table reference remains.
+        if (fd_supports_force_shutdown(fd) &&
+                !bit_test(f, table->force_shutdown)) {
+            fd_mark_force_shutdown(fd, 1);
+            bit_set(f, table->force_shutdown);
+        }
+        bit_set(f, table->force_detach_closed);
+        bit_clear(f, table->cloexec);
+        return 0;
+    }
     int err = fd_close_internal(fd, bit_test(f, table->force_shutdown));
     table->files[f] = NULL;
     bit_clear(f, table->cloexec);
@@ -489,7 +543,7 @@ dword_t sys_close_range(dword_t first, dword_t last, dword_t flags) {
     unsigned hi = last;
     if (hi >= table->size) hi = table->size > 0 ? table->size - 1 : 0;
     for (unsigned f = first; f <= hi; f++) {
-        if (table->files[f] == NULL) continue;
+        if (fdtable_get(table, f) == NULL) continue;
         if (flags & CLOSE_RANGE_CLOEXEC_) {
             bit_set(f, table->cloexec);
         } else {
@@ -563,20 +617,29 @@ static dword_t duplicate_to(fd_t f, fd_t new_f, int_t flags,
         unlock(&table->lock);
         return new_f;
     }
+    if (table->unsnapshotted_force_detached_refs != 0) {
+        unlock(&table->lock);
+        return _EBUSY;
+    }
     int err = fdtable_expand(table, new_f, nofile_limit);
     if (err < 0) {
         unlock(&table->lock);
         return err;
     }
+    if (bit_test(new_f, table->force_detach_closed)) {
+        unlock(&table->lock);
+        return _EBUSY;
+    }
     if (table->files[new_f] != NULL) {
         int close_error = fdtable_close(table, new_f);
-        if (close_error < 0) {
+        if (close_error == _EBUSY) {
             unlock(&table->lock);
             return close_error;
         }
     }
     fd_retain(fd);
     table->files[new_f] = fd;
+    bit_clear(new_f, table->force_detach_closed);
     bit_clear(new_f, table->force_shutdown);
     if (flags & O_CLOEXEC_)
         bit_set(new_f, table->cloexec);
