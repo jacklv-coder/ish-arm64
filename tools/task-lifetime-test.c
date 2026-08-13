@@ -707,6 +707,30 @@ static void test_copied_group_drops_exit_only_state(void) {
     assert(!group.reap_deferred);
 }
 
+static void test_group_exit_rejects_replacement_itimer(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+    current = leader;
+
+    // The force-detach path deliberately drops group->lock while waiting for
+    // an old timer callback. Any thread that reaches alarm/setitimer during
+    // that interval must not publish a replacement timer retaining a raw task
+    // pointer.
+    group->doing_group_exit = true;
+    assert((int_t) sys_alarm(1) == _EINTR);
+    assert(group->itimer == NULL);
+
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
 static void test_dispose_waits_for_pinned_ptrace_user(void) {
     struct task *task = task_create_(NULL);
     assert(task != NULL);
@@ -758,6 +782,7 @@ int main(void) {
     test_force_detach_preserves_fd_shared_by_copied_table();
     test_force_detach_shuts_down_private_socket();
     test_copied_group_drops_exit_only_state();
+    test_group_exit_rejects_replacement_itimer();
     test_dispose_waits_for_pinned_ptrace_user();
     return 0;
 }

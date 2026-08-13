@@ -121,6 +121,14 @@ static int itimer_set(struct tgroup *group, int which, struct timer_spec spec, s
         return _EINVAL;
     }
 
+    // Group exit may temporarily drop group->lock while synchronously
+    // destroying the previous timer. Do not allow another thread to install a
+    // replacement in that window: ITIMER_REAL retains a raw task pointer and
+    // the force-detached task may be disposed as soon as its host syscall
+    // returns.
+    if (group->doing_group_exit || current->exiting || current->force_detached)
+        return _EINTR;
+
     if (!group->itimer) {
         struct timer *timer = timer_new(CLOCK_REALTIME, (timer_callback_t) itimer_notify, current);
         if (IS_ERR(timer))
