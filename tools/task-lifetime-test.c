@@ -42,6 +42,11 @@ struct task_disposer {
     atomic_bool finished;
 };
 
+struct detached_task_finisher {
+    struct task *task;
+    atomic_bool started;
+};
+
 struct vfork_observer {
     struct vfork_info *vfork;
     struct task *address_space_owner;
@@ -116,6 +121,13 @@ static void *normal_guest_exit(void *opaque) {
 
 static void *finish_detached_guest_exit(void *opaque) {
     current = opaque;
+    task_finish_force_detached_exit();
+}
+
+static void *finish_detached_guest_exit_observed(void *opaque) {
+    struct detached_task_finisher *finisher = opaque;
+    current = finisher->task;
+    atomic_store(&finisher->started, true);
     task_finish_force_detached_exit();
 }
 
@@ -773,6 +785,50 @@ static void test_dispose_waits_for_pinned_ptrace_user(void) {
     assert(pthread_mutex_destroy(&blocked.lock) == 0);
 }
 
+static void test_force_detached_cleanup_uses_global_lock_order(void) {
+    struct task *task = task_create_(NULL);
+    assert(task != NULL);
+    struct tgroup *group = make_group(task);
+    task_set_mm(task, make_mapped_mm());
+
+    // Hold pids_lock while the cleanup thread starts. Correct cleanup must
+    // block on this lock before touching ptrace.lock. The old inverse order
+    // acquired ptrace.lock first and then waited for pids_lock, forming an
+    // ABBA deadlock with wait4/ptrace/task disposal.
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    unlock(&group->lock);
+
+    struct detached_task_finisher finisher = {.task = task};
+    atomic_init(&finisher.started, false);
+    pthread_t cleanup;
+    assert(pthread_create(&cleanup, NULL,
+            finish_detached_guest_exit_observed, &finisher) == 0);
+    while (!atomic_load(&finisher.started)) {
+        struct timespec delay = {.tv_nsec = 1000000L};
+        nanosleep(&delay, NULL);
+    }
+    struct timespec settle = {.tv_nsec = 10 * 1000000L};
+    nanosleep(&settle, NULL);
+    assert(trylock(&task->ptrace.lock) == 0);
+    unlock(&task->ptrace.lock);
+    unlock(&pids_lock);
+
+    assert(pthread_join(cleanup, NULL) == 0);
+    assert(group->force_detached_count == 0);
+    assert(task->mm == NULL);
+    assert(task->mem == NULL);
+
+    lock(&pids_lock);
+    task_destroy(task);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
 int main(void) {
     test_nonleader_resources_follow_host_pthread();
     test_force_detached_leader_stays_hidden_until_zombie();
@@ -784,5 +840,6 @@ int main(void) {
     test_copied_group_drops_exit_only_state();
     test_group_exit_rejects_replacement_itimer();
     test_dispose_waits_for_pinned_ptrace_user();
+    test_force_detached_cleanup_uses_global_lock_order();
     return 0;
 }
