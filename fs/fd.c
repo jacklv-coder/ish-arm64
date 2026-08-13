@@ -308,9 +308,10 @@ struct fdtable *fdtable_copy(struct fdtable *table) {
     return new_table;
 }
 
-static int fdtable_expand(struct fdtable *table, fd_t max) {
+static int fdtable_expand(struct fdtable *table, fd_t max,
+        rlim_t_ nofile_limit) {
     unsigned size = max + 1;
-    if (size > rlimit(RLIMIT_NOFILE_))
+    if (size > nofile_limit)
         return _EMFILE;
     if (table->size >= size)
         return 0;
@@ -330,10 +331,11 @@ struct fd *f_get(fd_t f) {
     return fd;
 }
 
-static fd_t f_install_start(struct fd *fd, fd_t start) {
+static fd_t f_install_start(struct fd *fd, fd_t start,
+        rlim_t_ nofile_limit) {
     assert(start >= 0);
     struct fdtable *table = current->files;
-    unsigned size = rlimit(RLIMIT_NOFILE_);
+    rlim_t_ size = nofile_limit;
     if (size > table->size)
         size = table->size;
 
@@ -342,7 +344,7 @@ static fd_t f_install_start(struct fd *fd, fd_t start) {
         if (table->files[f] == NULL)
             break;
     if ((unsigned) f >= size) {
-        int err = fdtable_expand(table, f);
+        int err = fdtable_expand(table, f, nofile_limit);
         if (err < 0)
             f = err;
     }
@@ -358,8 +360,9 @@ static fd_t f_install_start(struct fd *fd, fd_t start) {
 }
 
 fd_t f_install(struct fd *fd, int flags) {
+    rlim_t_ nofile_limit = rlimit(RLIMIT_NOFILE_);
     lock(&current->files->lock);
-    fd_t f = f_install_start(fd, 0);
+    fd_t f = f_install_start(fd, 0, nofile_limit);
     if (f >= 0) {
         if (flags & O_CLOEXEC_)
             bit_set(f, current->files->cloexec);
@@ -467,6 +470,7 @@ void fdtable_do_cloexec(struct fdtable *table) {
 dword_t sys_dup(fd_t f) {
     STRACE("dup(%d)", f);
     struct fdtable *table = current->files;
+    rlim_t_ nofile_limit = rlimit(RLIMIT_NOFILE_);
     lock(&table->lock);
     struct fd *fd = fdtable_get(table, f);
     if (fd == NULL) {
@@ -474,14 +478,20 @@ dword_t sys_dup(fd_t f) {
         return _EBADF;
     }
     fd_retain(fd);
-    fd_t new_f = f_install_start(fd, 0);
+    fd_t new_f = f_install_start(fd, 0, nofile_limit);
     unlock(&table->lock);
     return new_f;
 }
 
-dword_t sys_dup3(fd_t f, fd_t new_f, int_t flags) {
-    STRACE("dup3(%d, %d, %d)", f, new_f, flags);
+static dword_t duplicate_to(fd_t f, fd_t new_f, int_t flags,
+        bool allow_same_descriptor) {
+    if (new_f < 0)
+        return _EBADF;
+    if (f == new_f && !allow_same_descriptor)
+        return _EINVAL;
+
     struct fdtable *table = current->files;
+    rlim_t_ nofile_limit = rlimit(RLIMIT_NOFILE_);
     lock(&table->lock);
     struct fd *fd = fdtable_get(table, f);
     if (fd == NULL)
@@ -490,7 +500,7 @@ dword_t sys_dup3(fd_t f, fd_t new_f, int_t flags) {
         unlock(&table->lock);
         return new_f;
     }
-    int err = fdtable_expand(table, new_f);
+    int err = fdtable_expand(table, new_f, nofile_limit);
     if (err < 0) {
         unlock(&table->lock);
         return err;
@@ -509,8 +519,16 @@ bad_fd:
     return _EBADF;
 }
 
+dword_t sys_dup3(fd_t f, fd_t new_f, int_t flags) {
+    STRACE("dup3(%d, %d, %d)", f, new_f, flags);
+    if (flags & ~O_CLOEXEC_)
+        return _EINVAL;
+    return duplicate_to(f, new_f, flags, false);
+}
+
 dword_t sys_dup2(fd_t f, fd_t new_f) {
-    return sys_dup3(f, new_f, 0);
+    STRACE("dup2(%d, %d)", f, new_f);
+    return duplicate_to(f, new_f, 0, true);
 }
 
 int fd_getflags(struct fd *fd) {
@@ -532,6 +550,7 @@ dword_t sys_fcntl(fd_t f, dword_t cmd, addr_t arg) {
     if (cmd == F_DUPFD_ || cmd == F_DUPFD_CLOEXEC_) {
         STRACE("fcntl(%d, %s, %d)", f,
             cmd == F_DUPFD_ ? "F_DUPFD" : "F_DUPFD_CLOEXEC", arg);
+        rlim_t_ nofile_limit = rlimit(RLIMIT_NOFILE_);
         lock(&table->lock);
         struct fd *duplicate = fdtable_get(table, f);
         if (duplicate == NULL) {
@@ -539,7 +558,7 @@ dword_t sys_fcntl(fd_t f, dword_t cmd, addr_t arg) {
             return _EBADF;
         }
         fd_retain(duplicate);
-        fd_t installed = f_install_start(duplicate, arg);
+        fd_t installed = f_install_start(duplicate, arg, nofile_limit);
         if (installed >= 0 && cmd == F_DUPFD_CLOEXEC_)
             bit_set(installed, table->cloexec);
         unlock(&table->lock);

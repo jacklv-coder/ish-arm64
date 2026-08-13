@@ -927,6 +927,40 @@ static void test_force_detach_preserves_same_group_shared_fdtable(void) {
     free(group);
 }
 
+static void test_dup_same_descriptor_semantics(void) {
+    struct task *task = task_create_(NULL);
+    assert(task != NULL);
+    struct tgroup *group = make_group(task);
+    group->limits[RLIMIT_NOFILE_].cur = 16;
+    group->limits[RLIMIT_NOFILE_].max = 16;
+    task->files = fdtable_new(1);
+    assert(!IS_ERR(task->files));
+
+    struct fd *fd = fd_create(&realfs_fdops);
+    assert(fd != NULL);
+    fd->real_fd = dup(STDIN_FILENO);
+    assert(fd->real_fd >= 0);
+    task->files->files[0] = fd;
+    current = task;
+
+    assert((int_t) sys_dup3(0, 0, O_CLOEXEC_) == _EINVAL);
+    assert((int_t) sys_dup3(0, 0, 0) == _EINVAL);
+    assert(sys_dup2(0, 0) == 0);
+    assert(task->files->files[0] == fd);
+    assert(atomic_load(&fd->refcount) == 1);
+
+    fdtable_release(task->files);
+    task->files = NULL;
+    list_remove(&task->group_links);
+    lock(&pids_lock);
+    task_destroy(task);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
 static void test_force_detach_closes_table_after_every_owner_detaches(void) {
     struct task *leader = task_create_(NULL);
     assert(leader != NULL);
@@ -1123,6 +1157,7 @@ int main(void) {
     test_force_detach_consumes_marker_on_inflight_close();
     test_force_detach_shuts_down_duplicated_private_socket();
     test_force_detach_preserves_same_group_shared_fdtable();
+    test_dup_same_descriptor_semantics();
     test_force_detach_closes_table_after_every_owner_detaches();
     test_copied_group_drops_exit_only_state();
     test_group_exit_rejects_replacement_itimer();
