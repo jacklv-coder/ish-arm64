@@ -194,9 +194,12 @@ noreturn void task_finish_force_detached_exit(void) {
             atomic_load(&task->exit_state);
     assert(exit_state == TASK_EXIT_FORCE_DETACHED);
 
-    // An overlapping ptrace request may still be reading registers or memory.
-    // Force-detach prevents new lookups; wait for the pinned reader before
-    // releasing the address space or other task-owned runtime state.
+    // Match the lookup/destruction order used by wait4, ptrace and
+    // task_dispose_locked: pids_lock pins the task and prevents new ptrace
+    // lookups, then ptrace.lock drains a reader that was already pinned.
+    // Taking these locks in the opposite order deadlocks with a lookup that
+    // already owns pids_lock and is waiting for ptrace.lock.
+    lock(&pids_lock);
     lock(&task->ptrace.lock);
     // Preserve the CLONE_CHILD_CLEARTID contract while the address space is
     // still available. This is idempotent with a partially completed do_exit.
@@ -204,7 +207,6 @@ noreturn void task_finish_force_detached_exit(void) {
     task_release_runtime_resources(task);
     unlock(&task->ptrace.lock);
 
-    lock(&pids_lock);
     if (task->sighand != NULL) {
         sighand_release(task->sighand);
         task->sighand = NULL;
