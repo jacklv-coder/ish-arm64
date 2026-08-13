@@ -10,6 +10,11 @@
 #include "fs/real.h"
 #include "fs/sock.h"
 
+// Weak so the lifetime test can exercise the low-memory safety-valve path.
+__attribute__((weak)) void *fdtable_force_detach_snapshot_alloc(size_t size) {
+    return malloc(size);
+}
+
 struct fd *fd_create(const struct fd_ops *ops) {
     struct fd *fd = malloc(sizeof(struct fd));
     if (fd == NULL)
@@ -105,6 +110,7 @@ struct fdtable *fdtable_new(int size) {
         return ERR_PTR(_ENOMEM);
     fdt->refcount = 1;
     fdt->force_detached_refs = 0;
+    fdt->unsnapshotted_force_detached_refs = 0;
     fdt->force_shutdown_complete = false;
     fdt->size = 0;
     fdt->files = NULL;
@@ -200,13 +206,60 @@ static void fdtable_shutdown_exclusive_locked(struct fdtable *table) {
     table->force_shutdown_complete = true;
 }
 
-void fdtable_mark_force_detached(struct fdtable *table) {
-    lock(&table->lock);
+static void fdtable_release_force_detach_snapshot(
+        struct fdtable_force_detach *snapshot) {
+    if (snapshot == NULL)
+        return;
+    for (unsigned index = 0; index < snapshot->count; index++)
+        fd_close_internal(snapshot->files[index], true);
+    free(snapshot);
+}
+
+struct fdtable_force_detach *fdtable_prepare_force_detach_locked(
+        struct fdtable *table) {
+    size_t files_size;
+    size_t allocation_size;
+    if (__builtin_mul_overflow((size_t) table->size,
+            sizeof(struct fd *), &files_size) ||
+            __builtin_add_overflow(sizeof(struct fdtable_force_detach),
+                files_size, &allocation_size)) {
+        return NULL;
+    }
+    struct fdtable_force_detach *snapshot =
+        fdtable_force_detach_snapshot_alloc(allocation_size);
+    if (snapshot == NULL)
+        return NULL;
+    snapshot->count = 0;
+    snapshot->capacity = table->size;
+    return snapshot;
+}
+
+void fdtable_commit_force_detach_locked(struct fdtable *table,
+        struct fdtable_force_detach *snapshot) {
+    if (snapshot == NULL) {
+        // Allocation failure must not disable group-exit's safety valve. Keep
+        // the table slots stable until this host pthread leaves its in-flight
+        // syscall; close/dup replacement returns EBUSY in the meantime.
+        table->unsnapshotted_force_detached_refs++;
+    } else {
+        assert(table->size <= snapshot->capacity);
+        for (fd_t slot = 0; (unsigned) slot < table->size; slot++) {
+            struct fd *fd = table->files[slot];
+            if (fd == NULL)
+                continue;
+            snapshot->files[snapshot->count++] = fd_retain(fd);
+            // The retained reference belongs only to a task that teardown is
+            // trying to wake. If runnable/copy-table owners later close their
+            // references, the host handle closes while this reference keeps
+            // the struct fd alive until the syscall returns.
+            if (fd_supports_force_shutdown(fd))
+                fd_mark_force_shutdown(fd, 1);
+        }
+    }
     assert(table->force_detached_refs < atomic_load(&table->refcount));
     table->force_detached_refs++;
     if (table->force_detached_refs == atomic_load(&table->refcount))
         fdtable_shutdown_exclusive_locked(table);
-    unlock(&table->lock);
 }
 
 // FIXME this looks like it has the classic refcount UAF
@@ -230,8 +283,16 @@ void fdtable_release(struct fdtable *table) {
     }
 }
 
-void fdtable_release_force_detached(struct fdtable *table) {
+void fdtable_release_force_detached(struct fdtable *table,
+        struct fdtable_force_detach *snapshot) {
+    // The host pthread has returned from every fd operation. Drop its borrowed
+    // descriptors before releasing its ownership of the table itself.
+    fdtable_release_force_detach_snapshot(snapshot);
     lock(&table->lock);
+    if (snapshot == NULL) {
+        assert(table->unsnapshotted_force_detached_refs > 0);
+        table->unsnapshotted_force_detached_refs--;
+    }
     assert(table->force_detached_refs > 0);
     table->force_detached_refs--;
     if (--table->refcount == 0) {
@@ -379,6 +440,8 @@ static int fdtable_close(struct fdtable *table, fd_t f) {
     struct fd *fd = table->files[f];
     if (fd == NULL)
         return _EBADF;
+    if (table->unsnapshotted_force_detached_refs != 0)
+        return _EBUSY;
     if (fd->inode != NULL) // temporary hack for files like sockets that right now don't have inodes but will eventually
         file_lock_remove_owned_by(fd, table);
     int err = fd_close_internal(fd, bit_test(f, table->force_shutdown));
@@ -505,8 +568,14 @@ static dword_t duplicate_to(fd_t f, fd_t new_f, int_t flags,
         unlock(&table->lock);
         return err;
     }
+    if (table->files[new_f] != NULL) {
+        int close_error = fdtable_close(table, new_f);
+        if (close_error < 0) {
+            unlock(&table->lock);
+            return close_error;
+        }
+    }
     fd_retain(fd);
-    fdtable_close(table, new_f);
     table->files[new_f] = fd;
     bit_clear(new_f, table->force_shutdown);
     if (flags & O_CLOEXEC_)

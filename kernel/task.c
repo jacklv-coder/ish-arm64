@@ -71,6 +71,7 @@ struct task *task_create_(struct task *parent) {
     cond_init(&task->ptrace.cond);
     atomic_init(&task->force_detached, false);
     atomic_init(&task->exit_state, TASK_EXIT_RUNNING);
+    task->force_detached_files = NULL;
     pid->task = task;
 
 #ifdef GUEST_ARM64

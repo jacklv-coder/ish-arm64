@@ -106,10 +106,22 @@ bool task_force_detach_for_group_exit_locked(struct task *task) {
     // The force-detach path is only for a task still blocked in guest work.
     int expected = TASK_EXIT_RUNNING;
     if (!atomic_compare_exchange_strong(&task->exit_state, &expected,
-            TASK_EXIT_FORCE_DETACHED)) {
+            TASK_EXIT_FORCE_DETACHED))
         return false;
+
+    // The exit-state claim prevents normal teardown from releasing task->files.
+    // pids_lock (required by this function) prevents the host pthread from
+    // completing force-detached cleanup until the snapshot is published.
+    struct fdtable_force_detach *files_snapshot = NULL;
+    if (task->files != NULL) {
+        lock(&task->files->lock);
+        files_snapshot = fdtable_prepare_force_detach_locked(task->files);
+        fdtable_commit_force_detach_locked(task->files, files_snapshot);
     }
+    task->force_detached_files = files_snapshot;
     atomic_store(&task->force_detached, true);
+    if (task->files != NULL)
+        unlock(&task->files->lock);
     task->exiting = true;
 
     list_remove(&task->group_links);
@@ -121,12 +133,6 @@ bool task_force_detach_for_group_exit_locked(struct task *task) {
     // published so its parent can observe and reap the process exit.
     if (!task_is_leader(task))
         task_unpublish_locked(task);
-
-    // Register this reference as deferred. The fdtable closes its host handles
-    // once every remaining owner is force-detached (or the last runnable owner
-    // releases it), waking blocked syscalls without disrupting a live owner.
-    if (task->files != NULL)
-        fdtable_mark_force_detached(task->files);
 
     // The group lock is part of this function's caller contract. Do not wait
     // for the timer callback while holding it: send_signal(SIGKILL) takes the
@@ -180,10 +186,13 @@ static void task_release_runtime_resources(struct task *task) {
     unlock(&task->general_lock);
     task_release_futex_pipe(task);
     if (task->files != NULL) {
-        if (atomic_load(&task->force_detached))
-            fdtable_release_force_detached(task->files);
-        else
+        if (atomic_load(&task->force_detached)) {
+            fdtable_release_force_detached(task->files,
+                    task->force_detached_files);
+            task->force_detached_files = NULL;
+        } else {
             fdtable_release(task->files);
+        }
         task->files = NULL;
     }
     if (task->fs != NULL) {

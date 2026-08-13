@@ -91,6 +91,10 @@ struct task {
     // The pthread keeps ownership of referenced runtime resources until it
     // reaches a safe cleanup boundary.
     atomic_bool force_detached;
+    // Per-descriptor references retained after claiming
+    // TASK_EXIT_FORCE_DETACHED. They keep an in-flight syscall's borrowed fd
+    // alive even if another CLONE_FILES owner closes the shared table slot.
+    struct fdtable_force_detach *force_detached_files;
 
     // this structure is allocated on the stack of the parent's clone() call
     struct vfork_info {

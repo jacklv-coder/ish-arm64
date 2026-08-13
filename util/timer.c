@@ -1,8 +1,17 @@
 #include <stdlib.h>
+#include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include "kernel/errno.h"
 #include "util/timer.h"
 #include "misc.h"
+
+// Weak so the host lifetime test can deterministically exercise pthread
+// resource exhaustion without changing production behavior.
+__attribute__((weak)) int timer_thread_create(pthread_t *thread,
+        void *(*start_routine)(void *), void *argument) {
+    return pthread_create(thread, NULL, start_routine, argument);
+}
 
 struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data) {
 //    assert(clockid == CLOCK_MONOTONIC || clockid == CLOCK_REALTIME);
@@ -96,7 +105,15 @@ int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *ol
         pthread_kill(timer->thread, SIGUSR1);
     } else if (timer->active) {
         timer->thread_running = true;
-        pthread_create(&timer->thread, NULL, timer_thread, timer);
+        int create_error = timer_thread_create(&timer->thread, timer_thread,
+                timer);
+        if (create_error != 0) {
+            timer->thread_running = false;
+            timer->active = false;
+            unlock(&timer->lock);
+            errno = create_error;
+            return errno_map();
+        }
         pthread_detach(timer->thread);
     }
     unlock(&timer->lock);
