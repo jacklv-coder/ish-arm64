@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -11,6 +12,22 @@
 #include "kernel/task.h"
 #include "fs/real.h"
 #include "fs/sock.h"
+
+static atomic_bool fail_timer_thread_create;
+static atomic_bool fail_fd_snapshot_alloc;
+
+void *fdtable_force_detach_snapshot_alloc(size_t size) {
+    if (atomic_exchange(&fail_fd_snapshot_alloc, false))
+        return NULL;
+    return malloc(size);
+}
+
+int timer_thread_create(pthread_t *thread,
+        void *(*start_routine)(void *), void *argument) {
+    if (atomic_exchange(&fail_timer_thread_create, false))
+        return EAGAIN;
+    return pthread_create(thread, NULL, start_routine, argument);
+}
 
 struct blocked_write {
     pthread_mutex_t lock;
@@ -569,6 +586,14 @@ static void test_force_detach_preserves_externally_shared_fdtable(void) {
     assert(write(atomic_load(&writer->real_fd), &value, 1) == 1);
     char received = 0;
     assert(read(shared_pipe[0], &received, 1) == 1 && received == value);
+
+    // Closing a CLONE_FILES slot must not free the struct fd still borrowed by
+    // the detached task's in-flight syscall. The force-detach snapshot pins it
+    // until that task reaches task_finish_force_detached_exit().
+    current = external;
+    assert(f_close(0) == 0);
+    assert(atomic_load(&writer->refcount) == 1);
+    assert(atomic_load(&writer->real_fd) == -1);
     close(shared_pipe[0]);
 
     pthread_t worker;
@@ -591,6 +616,203 @@ static void test_force_detach_preserves_externally_shared_fdtable(void) {
     task_destroy(leader);
     unlock(&pids_lock);
     current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
+static void test_timer_create_failure_does_not_leave_running_state(void) {
+    struct timer *timer = timer_new(CLOCK_MONOTONIC, async_signal_callback,
+            NULL);
+    assert(timer != NULL);
+    struct timer_spec previous = {
+        .value = {0},
+        .interval = {.tv_sec = 7},
+    };
+    assert(timer_set(timer, previous, NULL) == 0);
+    struct timespec previous_start = timer->start;
+    struct timespec previous_end = timer->end;
+    atomic_store(&fail_timer_thread_create, true);
+    struct timer_spec spec = {
+        .value = {.tv_nsec = 1000000L},
+        .interval = {0},
+    };
+    assert(timer_set(timer, spec, NULL) == _EAGAIN);
+    assert(!timer->thread_running);
+    assert(!timer->active);
+    assert(timer->start.tv_sec == previous_start.tv_sec);
+    assert(timer->start.tv_nsec == previous_start.tv_nsec);
+    assert(timer->end.tv_sec == previous_end.tv_sec);
+    assert(timer->end.tv_nsec == previous_end.tv_nsec);
+    assert(timer->interval.tv_sec == 7);
+    assert(timer->interval.tv_nsec == 0);
+    timer_free_sync(timer);
+}
+
+static void test_force_detach_snapshot_oom_pins_and_wakes_shared_close(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+    task->files = fdtable_new(2);
+    assert(!IS_ERR(task->files));
+
+    struct task *external = task_create_(NULL);
+    assert(external != NULL);
+    struct tgroup *external_group = make_group(external);
+    external_group->limits[RLIMIT_NOFILE_].cur = 16;
+    external_group->limits[RLIMIT_NOFILE_].max = 16;
+    external->files = task->files;
+    external->files->refcount++;
+
+    struct fd *fd = fd_create(&realfs_fdops);
+    assert(fd != NULL);
+    fd->real_fd = dup(STDIN_FILENO);
+    assert(fd->real_fd >= 0);
+    task->files->files[0] = fd;
+    struct fd *source = fd_create(&realfs_fdops);
+    assert(source != NULL);
+    source->real_fd = dup(STDIN_FILENO);
+    assert(source->real_fd >= 0);
+    task->files->files[1] = source;
+
+    current = leader;
+    atomic_store(&fail_fd_snapshot_alloc, true);
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+    assert(task->force_detached_files == NULL);
+    assert(task->files->unsnapshotted_force_detached_refs == 1);
+
+    current = external;
+    assert(f_close(0) == 0);
+    assert(external->files->files[0] == fd);
+    assert(fdtable_get(external->files, 0) == NULL);
+    assert(atomic_load(&fd->real_fd) == -1);
+    assert(f_close(0) == _EBADF);
+    assert((int_t) sys_dup2(0, 1) == _EBADF);
+
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL, finish_detached_guest_exit, task) == 0);
+    assert(pthread_join(worker, NULL) == 0);
+    assert(external->files->unsnapshotted_force_detached_refs == 0);
+    // The hidden table reference remains until the shared table is destroyed,
+    // so any syscall that borrowed fd before close cannot observe freed memory.
+    assert(external->files->files[0] == fd);
+    assert(fdtable_get(external->files, 0) == NULL);
+    assert(atomic_load(&fd->refcount) == 1);
+    assert((int_t) sys_dup2(1, 0) == _EBUSY);
+    assert(external->files->files[0] == fd);
+
+    struct fdtable *copied = fdtable_copy(external->files);
+    assert(!IS_ERR(copied));
+    assert(copied->files[0] == NULL);
+    assert(copied->files[1] == source);
+    fdtable_release(copied);
+
+    struct fdtable *shared_files = external->files;
+    external->files = NULL;
+    fdtable_release(shared_files);
+    list_remove(&external->group_links);
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(external);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&external_group->child_exit);
+    cond_destroy(&external_group->stopped_cond);
+    free(external_group);
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
+static void test_snapshot_after_oom_pins_tombstoned_descriptor(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+    struct task *oom_task = task_create_(leader);
+    struct task *snapshot_task = task_create_(leader);
+    assert(oom_task != NULL && snapshot_task != NULL);
+    oom_task->group = snapshot_task->group = group;
+    oom_task->tgid = snapshot_task->tgid = leader->tgid;
+    list_add(&group->threads, &oom_task->group_links);
+    list_add(&group->threads, &snapshot_task->group_links);
+
+    oom_task->files = fdtable_new(1);
+    assert(!IS_ERR(oom_task->files));
+    snapshot_task->files = oom_task->files;
+    snapshot_task->files->refcount++;
+
+    struct task *external = task_create_(NULL);
+    assert(external != NULL);
+    struct tgroup *external_group = make_group(external);
+    external->files = oom_task->files;
+    external->files->refcount++;
+
+    struct fd *fd = fd_create(&realfs_fdops);
+    assert(fd != NULL);
+    fd->real_fd = dup(STDIN_FILENO);
+    assert(fd->real_fd >= 0);
+    oom_task->files->files[0] = fd;
+
+    current = leader;
+    atomic_store(&fail_fd_snapshot_alloc, true);
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(oom_task));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    current = external;
+    assert(f_close(0) == 0);
+    assert(fdtable_get(external->files, 0) == NULL);
+    assert(atomic_load(&fd->refcount) == 1);
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(snapshot_task));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+    assert(snapshot_task->force_detached_files != NULL);
+    assert(snapshot_task->force_detached_files->count == 1);
+    assert(atomic_load(&fd->refcount) == 2);
+
+    pthread_t oom_worker;
+    assert(pthread_create(&oom_worker, NULL, finish_detached_guest_exit,
+            oom_task) == 0);
+    assert(pthread_join(oom_worker, NULL) == 0);
+    assert(external->files->files[0] == fd);
+    assert(fdtable_get(external->files, 0) == NULL);
+    assert(atomic_load(&fd->refcount) == 2);
+
+    pthread_t snapshot_worker;
+    assert(pthread_create(&snapshot_worker, NULL, finish_detached_guest_exit,
+            snapshot_task) == 0);
+    assert(pthread_join(snapshot_worker, NULL) == 0);
+    assert(atomic_load(&fd->refcount) == 1);
+
+    struct fdtable *shared_files = external->files;
+    external->files = NULL;
+    fdtable_release(shared_files);
+    list_remove(&external->group_links);
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(external);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&external_group->child_exit);
+    cond_destroy(&external_group->stopped_cond);
+    free(external_group);
     cond_destroy(&group->child_exit);
     cond_destroy(&group->stopped_cond);
     free(group);
@@ -1146,6 +1368,9 @@ static void test_force_detached_cleanup_uses_global_lock_order(void) {
 }
 
 int main(void) {
+    test_timer_create_failure_does_not_leave_running_state();
+    test_force_detach_snapshot_oom_pins_and_wakes_shared_close();
+    test_snapshot_after_oom_pins_tombstoned_descriptor();
     test_nonleader_resources_follow_host_pthread();
     test_force_detached_leader_stays_hidden_until_zombie();
     test_reap_waits_for_force_detached_leader();

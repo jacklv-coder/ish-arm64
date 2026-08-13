@@ -415,7 +415,8 @@ static bool proc_pid_fd_readdir(struct proc_entry *entry, unsigned long *index, 
     if (task == NULL)
         return _ESRCH;
     lock(&task->files->lock);
-    while (*index < task->files->size && task->files->files[*index] == NULL)
+    while (*index < task->files->size &&
+            fdtable_get(task->files, *index) == NULL)
         (*index)++;
     fd_t f = (*index)++;
     bool any_left = (unsigned) f < task->files->size;
@@ -435,7 +436,7 @@ static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
         return _ESRCH;
     lock(&task->files->lock);
     struct fd *fd = fdtable_get(task->files, entry->fd);
-    int err = generic_getpath(fd, buf);
+    int err = fd == NULL ? _ENOENT : generic_getpath(fd, buf);
     unlock(&task->files->lock);
     proc_put_task(task);
     return err;

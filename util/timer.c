@@ -1,8 +1,17 @@
 #include <stdlib.h>
+#include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include "kernel/errno.h"
 #include "util/timer.h"
 #include "misc.h"
+
+// Weak so the host lifetime test can deterministically exercise pthread
+// resource exhaustion without changing production behavior.
+__attribute__((weak)) int timer_thread_create(pthread_t *thread,
+        void *(*start_routine)(void *), void *argument) {
+    return pthread_create(thread, NULL, start_routine, argument);
+}
 
 struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data) {
 //    assert(clockid == CLOCK_MONOTONIC || clockid == CLOCK_REALTIME);
@@ -12,6 +21,9 @@ struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data
     timer->data = data;
     timer->active = false;
     timer->thread_running = false;
+    timer->start = (struct timespec) {};
+    timer->end = (struct timespec) {};
+    timer->interval = (struct timespec) {};
     lock_init(&timer->lock);
     cond_init(&timer->finished);
     timer->dead = false;
@@ -83,6 +95,10 @@ static void *timer_thread(void *param) {
 int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *oldspec) {
     lock(&timer->lock);
     struct timespec now = timespec_now(timer->clockid);
+    struct timespec previous_start = timer->start;
+    struct timespec previous_end = timer->end;
+    struct timespec previous_interval = timer->interval;
+    bool previous_active = timer->active;
     if (oldspec != NULL) {
         oldspec->value = timespec_subtract(timer->end, now);
         oldspec->interval = timer->interval;
@@ -96,7 +112,18 @@ int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *ol
         pthread_kill(timer->thread, SIGUSR1);
     } else if (timer->active) {
         timer->thread_running = true;
-        pthread_create(&timer->thread, NULL, timer_thread, timer);
+        int create_error = timer_thread_create(&timer->thread, timer_thread,
+                timer);
+        if (create_error != 0) {
+            timer->thread_running = false;
+            timer->start = previous_start;
+            timer->end = previous_end;
+            timer->interval = previous_interval;
+            timer->active = previous_active;
+            unlock(&timer->lock);
+            errno = create_error;
+            return errno_map();
+        }
         pthread_detach(timer->thread);
     }
     unlock(&timer->lock);

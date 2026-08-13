@@ -579,9 +579,12 @@ static int exec_handler(native_handler_func handler, const char *guest_file,
     // Get guest stdio fds (retain for forwarding threads)
     struct fd *guest_stdin = NULL, *guest_stdout = NULL, *guest_stderr = NULL;
     lock(&current->files->lock);
-    if (current->files->files[0]) guest_stdin  = fd_retain(current->files->files[0]);
-    if (current->files->files[1]) guest_stdout = fd_retain(current->files->files[1]);
-    if (current->files->files[2]) guest_stderr = fd_retain(current->files->files[2]);
+    struct fd *fd0 = fdtable_get(current->files, 0);
+    struct fd *fd1 = fdtable_get(current->files, 1);
+    struct fd *fd2 = fdtable_get(current->files, 2);
+    if (fd0) guest_stdin = fd_retain(fd0);
+    if (fd1) guest_stdout = fd_retain(fd1);
+    if (fd2) guest_stderr = fd_retain(fd2);
     unlock(&current->files->lock);
 
     // Create pipes: handler writes to pipe write-end, forwarding thread reads
@@ -674,9 +677,12 @@ static int exec_posix_spawn(const char *native_path, const char *guest_file,
     // Get stdio fds
     int stdin_fd = -1, stdout_fd = -1, stderr_fd = -1;
     lock(&current->files->lock);
-    if (current->files->files[0]) stdin_fd  = current->files->files[0]->real_fd;
-    if (current->files->files[1]) stdout_fd = current->files->files[1]->real_fd;
-    if (current->files->files[2]) stderr_fd = current->files->files[2]->real_fd;
+    struct fd *fd0 = fdtable_get(current->files, 0);
+    struct fd *fd1 = fdtable_get(current->files, 1);
+    struct fd *fd2 = fdtable_get(current->files, 2);
+    if (fd0) stdin_fd = fd0->real_fd;
+    if (fd1) stdout_fd = fd1->real_fd;
+    if (fd2) stderr_fd = fd2->real_fd;
     unlock(&current->files->lock);
 
     // Pipes for stdout/stderr (\r → \n conversion)

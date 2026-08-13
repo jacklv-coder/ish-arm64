@@ -178,6 +178,12 @@ struct fdtable {
     // References owned by force-detached tasks. Protected by lock. When every
     // remaining owner is deferred, host handles can be closed to wake them.
     unsigned force_detached_refs;
+    // Force-detached owners that could not allocate a per-descriptor snapshot.
+    // While nonzero, installs/copies are frozen and closed slots remain as
+    // hidden tombstones until the table itself is destroyed. The table's own
+    // slot reference pins any in-flight borrow held by a shared owner.
+    // Protected by lock.
+    unsigned unsnapshotted_force_detached_refs;
     // Prevent repeated descriptor scans as deferred owners finish. Protected
     // by lock and set only after a complete shutdown pass.
     bool force_shutdown_complete;
@@ -187,13 +193,30 @@ struct fdtable {
     // Slots whose fd references were registered by the forced-shutdown scan.
     // A syscall may still install new descriptors after that snapshot.
     bits_t *force_shutdown;
+    bits_t *force_detach_closed;
     lock_t lock;
+};
+
+// Descriptor references borrowed by a force-detached task while its host
+// pthread finishes an in-flight syscall. The snapshot is separate from the
+// shared fd table because another CLONE_FILES owner may close or replace a slot
+// before the detached pthread reaches its cleanup boundary.
+struct fdtable_force_detach {
+    unsigned count;
+    unsigned capacity;
+    struct fd *files[];
 };
 
 struct fdtable *fdtable_new(int size);
 void fdtable_release(struct fdtable *table);
-void fdtable_mark_force_detached(struct fdtable *table);
-void fdtable_release_force_detached(struct fdtable *table);
+// The caller holds table->lock. NULL is a supported low-memory result: commit
+// switches the table into fail-closed mode until that detached task returns.
+struct fdtable_force_detach *fdtable_prepare_force_detach_locked(
+        struct fdtable *table);
+void fdtable_commit_force_detach_locked(struct fdtable *table,
+        struct fdtable_force_detach *snapshot);
+void fdtable_release_force_detached(struct fdtable *table,
+        struct fdtable_force_detach *snapshot);
 struct fdtable *fdtable_copy(struct fdtable *table);
 void fdtable_free(struct fdtable *table);
 void fdtable_do_cloexec(struct fdtable *table);
