@@ -51,9 +51,9 @@ struct asbestos {
     // becomes non-empty. Threads check this to know when cleanup is needed.
     _Atomic unsigned jetsam_gen;
 
-    // Lock order is dirty_coherence_lock -> lock. Compilation holds this for
-    // write from before reading guest bytes through insertion. Dirty drains
-    // hold it for read until their set is either proven code-free or consumed.
+    // Lock order is dirty_coherence_lock -> lock. wrlock_t provides
+    // writer-preferring acquisition; dirty drains continue to take only the
+    // read side and may run concurrently.
     wrlock_t dirty_coherence_lock;
     lock_t lock;
     wrlock_t jetsam_lock;

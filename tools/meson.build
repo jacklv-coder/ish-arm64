@@ -11,6 +11,11 @@ if get_option('kernel') == 'ish'
         task_lifetime_test = executable('task-lifetime-test',
             ['task-lifetime-test.c'], dependencies: [ish])
         test('task-lifetime', task_lifetime_test)
+
+        wrlock_writer_preference_test = executable('wrlock-writer-preference-test',
+            ['wrlock-writer-preference-test.c'], dependencies: [ish])
+        test('wrlock-writer-preference', wrlock_writer_preference_test,
+            timeout: 30)
     endif
 
     # The differential tracers model the x86 guest CPU state.

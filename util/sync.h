@@ -103,12 +103,21 @@ void notify(cond_t *cond);
 // Wake up one waiter.
 void notify_once(cond_t *cond);
 
-// this is a read-write lock that prefers writers, i.e. if there are any
+// This is a read-write lock that prefers writers, i.e. if there are any
 // writers waiting a read lock will block.
-// on darwin pthread_rwlock_t is already like this, on linux you can configure
-// it to prefer writers. not worrying about anything else right now.
+//
+// Darwin's pthread rwlock can leave both the queued writer and later readers
+// asleep under the read-to-write upgrade pattern used by mem_ptr. Implement
+// the small amount of state we need with a mutex and condition variable on
+// Apple platforms. Linux keeps its native writer-preferring rwlock.
 typedef struct {
+#ifdef __APPLE__
+    pthread_mutex_t state_lock;
+    pthread_cond_t state_changed;
+    unsigned waiting_writers;
+#else
     pthread_rwlock_t l;
+#endif
     // 0: unlocked
     // -1: write-locked
     // >0: read-locked with this many readers
@@ -118,6 +127,11 @@ typedef struct {
     int pid;
 } wrlock_t;
 static inline void wrlock_init(wrlock_t *lock) {
+#ifdef __APPLE__
+    if (pthread_mutex_init(&lock->state_lock, NULL)) __builtin_trap();
+    if (pthread_cond_init(&lock->state_changed, NULL)) __builtin_trap();
+    lock->waiting_writers = 0;
+#else
     pthread_rwlockattr_t *pattr = NULL;
 #if defined(__GLIBC__)
     pthread_rwlockattr_t attr;
@@ -126,46 +140,107 @@ static inline void wrlock_init(wrlock_t *lock) {
     pthread_rwlockattr_setkind_np(pattr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
 #endif
     if (pthread_rwlock_init(&lock->l, pattr)) __builtin_trap();
+#endif
     lock->val = lock->line = lock->pid = 0;
     lock->file = NULL;
 }
 
 extern int current_pid(void);
 static inline void wrlock_destroy(wrlock_t *lock) {
+#ifdef __APPLE__
+    if (pthread_cond_destroy(&lock->state_changed) != 0) __builtin_trap();
+    if (pthread_mutex_destroy(&lock->state_lock) != 0) __builtin_trap();
+#else
     if (pthread_rwlock_destroy(&lock->l) != 0) __builtin_trap();
+#endif
 }
 static inline void read_wrlock(wrlock_t *lock) {
+#ifdef __APPLE__
+    if (pthread_mutex_lock(&lock->state_lock) != 0) __builtin_trap();
+    while (lock->val < 0 || lock->waiting_writers != 0) {
+        if (pthread_cond_wait(&lock->state_changed, &lock->state_lock) != 0)
+            __builtin_trap();
+    }
+    lock->val++;
+    if (pthread_mutex_unlock(&lock->state_lock) != 0) __builtin_trap();
+#else
     if (pthread_rwlock_rdlock(&lock->l) != 0) __builtin_trap();
     assert(lock->val >= 0);
     lock->val++;
+#endif
 }
 static inline void read_wrunlock(wrlock_t *lock) {
+#ifdef __APPLE__
+    if (pthread_mutex_lock(&lock->state_lock) != 0) __builtin_trap();
+    assert(lock->val > 0);
+    lock->val--;
+    if (lock->val == 0 && lock->waiting_writers != 0) {
+        if (pthread_cond_broadcast(&lock->state_changed) != 0)
+            __builtin_trap();
+    }
+    if (pthread_mutex_unlock(&lock->state_lock) != 0) __builtin_trap();
+#else
     assert(lock->val > 0);
     lock->val--;
     if (pthread_rwlock_unlock(&lock->l) != 0) __builtin_trap();
+#endif
 }
 static inline void __write_wrlock(wrlock_t *lock, const char *file, int line) {
+#ifdef __APPLE__
+    if (pthread_mutex_lock(&lock->state_lock) != 0) __builtin_trap();
+    lock->waiting_writers++;
+    while (lock->val != 0) {
+        if (pthread_cond_wait(&lock->state_changed, &lock->state_lock) != 0)
+            __builtin_trap();
+    }
+    lock->waiting_writers--;
+#else
     if (pthread_rwlock_wrlock(&lock->l) != 0) __builtin_trap();
+#endif
     assert(lock->val == 0);
     lock->val = -1;
     lock->file = file;
     lock->line = line;
     lock->pid = current_pid();
+#ifdef __APPLE__
+    if (pthread_mutex_unlock(&lock->state_lock) != 0) __builtin_trap();
+#endif
 }
 #define write_wrlock(lock) __write_wrlock(lock, __FILE__, __LINE__)
 static inline bool write_wrtrylock(wrlock_t *lock) {
+#ifdef __APPLE__
+    int err = pthread_mutex_trylock(&lock->state_lock);
+    if (err == EBUSY) return false;
+    if (err != 0) __builtin_trap();
+    if (lock->val != 0 || lock->waiting_writers != 0) {
+        if (pthread_mutex_unlock(&lock->state_lock) != 0) __builtin_trap();
+        return false;
+    }
+#else
     int err = pthread_rwlock_trywrlock(&lock->l);
     if (err == EBUSY) return false;
     if (err != 0) __builtin_trap();
+#endif
     assert(lock->val == 0);
     lock->val = -1;
+#ifdef __APPLE__
+    if (pthread_mutex_unlock(&lock->state_lock) != 0) __builtin_trap();
+#endif
     return true;
 }
 static inline void write_wrunlock(wrlock_t *lock) {
+#ifdef __APPLE__
+    if (pthread_mutex_lock(&lock->state_lock) != 0) __builtin_trap();
+#endif
     assert(lock->val == -1);
     lock->val = lock->line = lock->pid = 0;
     lock->file = NULL;
+#ifdef __APPLE__
+    if (pthread_cond_broadcast(&lock->state_changed) != 0) __builtin_trap();
+    if (pthread_mutex_unlock(&lock->state_lock) != 0) __builtin_trap();
+#else
     if (pthread_rwlock_unlock(&lock->l) != 0) __builtin_trap();
+#endif
 }
 
 extern __thread sigjmp_buf unwind_buf;
