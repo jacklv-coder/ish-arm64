@@ -213,6 +213,55 @@ dword_t sys_mknod(addr_t path_addr, mode_t_ mode, dev_t_ dev) {
     return sys_mknodat(AT_FDCWD_, path_addr, mode, dev);
 }
 
+static ssize_t cancellable_fd_read(struct fd *fd, void *buf, size_t size) {
+    int cancel_state;
+    // fakefs copies realfs_fdops and overrides only readdir, so identify the
+    // blocking host callback itself rather than the fd_ops table address.
+    bool cancellable = fd->ops->read == realfs_read;
+    if (cancellable)
+        task_cancellable_host_io_begin(&cancel_state);
+    ssize_t res = fd->ops->read(fd, buf, size);
+    if (cancellable)
+        task_cancellable_host_io_end(cancel_state);
+    return res;
+}
+
+static ssize_t cancellable_fd_write(struct fd *fd, const void *buf,
+        size_t size) {
+    int cancel_state;
+    bool cancellable = fd->ops->write == realfs_write;
+    if (cancellable)
+        task_cancellable_host_io_begin(&cancel_state);
+    ssize_t res = fd->ops->write(fd, buf, size);
+    if (cancellable)
+        task_cancellable_host_io_end(cancel_state);
+    return res;
+}
+
+static ssize_t cancellable_fd_pread(struct fd *fd, void *buf, size_t size,
+        off_t offset) {
+    int cancel_state;
+    bool cancellable = fd->ops->pread == realfs_fdops.pread;
+    if (cancellable)
+        task_cancellable_host_io_begin(&cancel_state);
+    ssize_t res = fd->ops->pread(fd, buf, size, offset);
+    if (cancellable)
+        task_cancellable_host_io_end(cancel_state);
+    return res;
+}
+
+static ssize_t cancellable_fd_pwrite(struct fd *fd, const void *buf,
+        size_t size, off_t offset) {
+    int cancel_state;
+    bool cancellable = fd->ops->pwrite == realfs_fdops.pwrite;
+    if (cancellable)
+        task_cancellable_host_io_begin(&cancel_state);
+    ssize_t res = fd->ops->pwrite(fd, buf, size, offset);
+    if (cancellable)
+        task_cancellable_host_io_end(cancel_state);
+    return res;
+}
+
 static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
     struct fd *fd = f_get(fd_no);
     if (fd == NULL)
@@ -222,9 +271,9 @@ static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
 
     ssize_t res;
     if (fd->ops->read) {
-        res = fd->ops->read(fd, buf, size);
+        res = cancellable_fd_read(fd, buf, size);
     } else if (fd->ops->pread) {
-        res = fd->ops->pread(fd, buf, size, fd->offset);
+        res = cancellable_fd_pread(fd, buf, size, fd->offset);
         if (res > 0) {
             fd->ops->lseek(fd, res, LSEEK_CUR);
         }
@@ -245,7 +294,13 @@ dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
     char *buf = (char *) malloc(size);
     if (buf == NULL)
         return _ENOMEM;
-    int_t res = sys_read_buf(fd_no, buf, size);
+    int_t res;
+    // A force-detached realfs read can cancel this pthread. Keep ownership of
+    // the syscall's temporary storage explicit until cancellation is disabled
+    // again by sys_read_buf.
+    pthread_cleanup_push(free, buf);
+    res = sys_read_buf(fd_no, buf, size);
+    pthread_cleanup_pop(0);
     if (res >= 0) {
         if (user_write(buf_addr, buf, res))
             res = _EFAULT;
@@ -338,9 +393,9 @@ static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
 
     ssize_t res;
     if (fd->ops->write) {
-        res = fd->ops->write(fd, buf, size);
+        res = cancellable_fd_write(fd, buf, size);
     } else if (fd->ops->pwrite) {
-        res = fd->ops->pwrite(fd, buf, size, fd->offset);
+        res = cancellable_fd_pwrite(fd, buf, size, fd->offset);
         if (res > 0) {
             fd->ops->lseek(fd, res, LSEEK_CUR);
         }
@@ -363,7 +418,10 @@ dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
     if (print_size > 100) print_size = 100;
     STRACE("write(%d, \"%.*s\", %d)", fd_no, print_size, buf, size);
 
+    // See sys_read: only the lock-free realfs write callback is cancellable.
+    pthread_cleanup_push(free, buf);
     res = sys_write_buf(fd_no, buf, size);
+    pthread_cleanup_pop(0);
 
 out:
     free(buf);
@@ -446,7 +504,12 @@ dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
         free(iovec);
         return _ENOMEM;
     }
-    ssize_t res = sys_read_buf(fd_no, buf, io_size);
+    ssize_t res;
+    pthread_cleanup_push(free, iovec);
+    pthread_cleanup_push(free, buf);
+    res = sys_read_buf(fd_no, buf, io_size);
+    pthread_cleanup_pop(0);
+    pthread_cleanup_pop(0);
     if (res < 0)
         goto error;
 
@@ -499,7 +562,11 @@ dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
         STRACE(" {\"%.*s\", %u}", print_size, buf + offset, iovec[i].len);
         offset += iovec[i].len;
     }
+    pthread_cleanup_push(free, iovec);
+    pthread_cleanup_push(free, buf);
     res = sys_write_buf(fd_no, buf, io_size);
+    pthread_cleanup_pop(0);
+    pthread_cleanup_pop(0);
 
 error:
     free(buf);
@@ -679,22 +746,30 @@ dword_t sys_pread(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     char *buf = malloc(size+1);
     if (buf == NULL)
         return _ENOMEM;
-    lock(&fd->lock);
     ssize_t res;
-    if (fd->ops->pread) {
-        res = fd->ops->pread(fd, buf, size, off);
+    if (fd->ops->pread == realfs_fdops.pread) {
+        // pread has an explicit offset and does not need fd->lock. Keeping the
+        // lock out of the cancellation scope makes forced teardown safe.
+        pthread_cleanup_push(free, buf);
+        res = cancellable_fd_pread(fd, buf, size, off);
+        pthread_cleanup_pop(0);
     } else {
-        off_t_ saved_off = fd->ops->lseek(fd, 0, LSEEK_CUR);
-        if ((res = fd->ops->lseek(fd, off, LSEEK_SET)) < 0) {
-            goto out;
+        lock(&fd->lock);
+        if (fd->ops->pread) {
+            res = fd->ops->pread(fd, buf, size, off);
+        } else {
+            off_t_ saved_off = fd->ops->lseek(fd, 0, LSEEK_CUR);
+            if ((res = fd->ops->lseek(fd, off, LSEEK_SET)) >= 0) {
+                res = fd->ops->read(fd, buf, size);
+                // This really shouldn't fail. The lseek man page lists these reasons:
+                // EBADF, ESPIPE: can't happen because the last lseek wouldn't have succeeded.
+                // EOVERFLOW: can't happen for LSEEK_SET.
+                // EINVAL: can't happen other than typoing LSEEK_SET, because we know saved_off is not negative.
+                off_t_ lseek_res = fd->ops->lseek(fd, saved_off, LSEEK_SET);
+                assert(lseek_res >= 0);
+            }
         }
-        res = fd->ops->read(fd, buf, size);
-        // This really shouldn't fail. The lseek man page lists these reasons:
-        // EBADF, ESPIPE: can't happen because the last lseek wouldn't have succeeded.
-        // EOVERFLOW: can't happen for LSEEK_SET.
-        // EINVAL: can't happen other than typoing LSEEK_SET, because we know saved_off is not negative.
-        off_t_ lseek_res = fd->ops->lseek(fd, saved_off, LSEEK_SET);
-        assert(lseek_res >= 0);
+        unlock(&fd->lock);
     }
     if (res >= 0) {
         buf[res] = '\0';
@@ -702,8 +777,6 @@ dword_t sys_pread(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
         if (user_write(buf_addr, buf, res))
             res = _EFAULT;
     }
-out:
-    unlock(&fd->lock);
     free(buf);
     return res;
 }
@@ -716,25 +789,33 @@ dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     char *buf = malloc(size+1);
     if (buf == NULL)
         return _ENOMEM;
-    if (user_read(buf_addr, buf, size))
+    if (user_read(buf_addr, buf, size)) {
+        free(buf);
         return _EFAULT;
-    lock(&fd->lock);
-    ssize_t res;
-    if (fd->ops->pwrite) {
-        res = fd->ops->pwrite(fd, buf, size, off);
-    } else {
-        off_t_ saved_off = fd->ops->lseek(fd, 0, LSEEK_CUR);
-        if ((res = fd->ops->lseek(fd, off, LSEEK_SET)) >= 0) {
-            res = fd->ops->write(fd, buf, size);
-            // This really shouldn't fail. The lseek man page lists these reasons:
-            // EBADF, ESPIPE: can't happen because the last lseek wouldn't have succeeded.
-            // EOVERFLOW: can't happen for LSEEK_SET.
-            // EINVAL: can't happen other than typoing LSEEK_SET, because we know saved_off is not negative.
-            off_t_ lseek_res = fd->ops->lseek(fd, saved_off, LSEEK_SET);
-            assert(lseek_res >= 0);
-        }
     }
-    unlock(&fd->lock);
+    ssize_t res;
+    if (fd->ops->pwrite == realfs_fdops.pwrite) {
+        pthread_cleanup_push(free, buf);
+        res = cancellable_fd_pwrite(fd, buf, size, off);
+        pthread_cleanup_pop(0);
+    } else {
+        lock(&fd->lock);
+        if (fd->ops->pwrite) {
+            res = fd->ops->pwrite(fd, buf, size, off);
+        } else {
+            off_t_ saved_off = fd->ops->lseek(fd, 0, LSEEK_CUR);
+            if ((res = fd->ops->lseek(fd, off, LSEEK_SET)) >= 0) {
+                res = fd->ops->write(fd, buf, size);
+                // This really shouldn't fail. The lseek man page lists these reasons:
+                // EBADF, ESPIPE: can't happen because the last lseek wouldn't have succeeded.
+                // EOVERFLOW: can't happen for LSEEK_SET.
+                // EINVAL: can't happen other than typoing LSEEK_SET, because we know saved_off is not negative.
+                off_t_ lseek_res = fd->ops->lseek(fd, saved_off, LSEEK_SET);
+                assert(lseek_res >= 0);
+            }
+        }
+        unlock(&fd->lock);
+    }
     free(buf);
     return res;
 }
@@ -742,7 +823,8 @@ dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
 // preadv/pwritev — ARM64 Linux ABI splits the loff_t offset into pos_l/pos_h
 // registers (5-argument syscall form), consistent with what musl's
 // src/unistd/pwritev.c emits. Combine them back into a 64-bit offset before
-// doing the pread/pwrite loop under fd->lock (like readv/writev).
+// doing the pread/pwrite operation. Native positioned I/O is safe without the
+// shared-offset lock; emulated seek-based fallbacks remain serialized.
 dword_t sys_preadv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count,
                    dword_t pos_l, dword_t pos_h) {
     off_t_ off = ((qword_t)pos_h << 32) | pos_l;
@@ -760,21 +842,29 @@ dword_t sys_preadv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count,
         return _ENOMEM;
     }
 
-    lock(&fd->lock);
     ssize_t res;
-    if (fd->ops->pread) {
-        res = fd->ops->pread(fd, buf, io_size, off);
-    } else if (fd->ops->lseek && fd->ops->read) {
-        off_t_ saved_off = fd->ops->lseek(fd, 0, LSEEK_CUR);
-        if ((res = fd->ops->lseek(fd, off, LSEEK_SET)) >= 0) {
-            res = fd->ops->read(fd, buf, io_size);
-            off_t_ lseek_res = fd->ops->lseek(fd, saved_off, LSEEK_SET);
-            assert(lseek_res >= 0);
-        }
+    if (fd->ops->pread == realfs_fdops.pread) {
+        pthread_cleanup_push(free, iovec);
+        pthread_cleanup_push(free, buf);
+        res = cancellable_fd_pread(fd, buf, io_size, off);
+        pthread_cleanup_pop(0);
+        pthread_cleanup_pop(0);
     } else {
-        res = _ESPIPE;
+        lock(&fd->lock);
+        if (fd->ops->pread) {
+            res = fd->ops->pread(fd, buf, io_size, off);
+        } else if (fd->ops->lseek && fd->ops->read) {
+            off_t_ saved_off = fd->ops->lseek(fd, 0, LSEEK_CUR);
+            if ((res = fd->ops->lseek(fd, off, LSEEK_SET)) >= 0) {
+                res = fd->ops->read(fd, buf, io_size);
+                off_t_ lseek_res = fd->ops->lseek(fd, saved_off, LSEEK_SET);
+                assert(lseek_res >= 0);
+            }
+        } else {
+            res = _ESPIPE;
+        }
+        unlock(&fd->lock);
     }
-    unlock(&fd->lock);
     if (res < 0)
         goto error;
 
@@ -823,20 +913,28 @@ dword_t sys_pwritev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count,
         offset += iovec[i].len;
     }
 
-    lock(&fd->lock);
-    if (fd->ops->pwrite) {
-        res = fd->ops->pwrite(fd, buf, io_size, off);
-    } else if (fd->ops->lseek && fd->ops->write) {
-        off_t_ saved_off = fd->ops->lseek(fd, 0, LSEEK_CUR);
-        if ((res = fd->ops->lseek(fd, off, LSEEK_SET)) >= 0) {
-            res = fd->ops->write(fd, buf, io_size);
-            off_t_ lseek_res = fd->ops->lseek(fd, saved_off, LSEEK_SET);
-            assert(lseek_res >= 0);
-        }
+    if (fd->ops->pwrite == realfs_fdops.pwrite) {
+        pthread_cleanup_push(free, iovec);
+        pthread_cleanup_push(free, buf);
+        res = cancellable_fd_pwrite(fd, buf, io_size, off);
+        pthread_cleanup_pop(0);
+        pthread_cleanup_pop(0);
     } else {
-        res = _ESPIPE;
+        lock(&fd->lock);
+        if (fd->ops->pwrite) {
+            res = fd->ops->pwrite(fd, buf, io_size, off);
+        } else if (fd->ops->lseek && fd->ops->write) {
+            off_t_ saved_off = fd->ops->lseek(fd, 0, LSEEK_CUR);
+            if ((res = fd->ops->lseek(fd, off, LSEEK_SET)) >= 0) {
+                res = fd->ops->write(fd, buf, io_size);
+                off_t_ lseek_res = fd->ops->lseek(fd, saved_off, LSEEK_SET);
+                assert(lseek_res >= 0);
+            }
+        } else {
+            res = _ESPIPE;
+        }
+        unlock(&fd->lock);
     }
-    unlock(&fd->lock);
 
 error:
     free(buf);
@@ -1481,12 +1579,12 @@ dword_t sys_sendfile64(fd_t out_fd, fd_t in_fd, addr_t offset_addr, dword_t coun
         if (offset_addr != 0) {
             if (!in->ops->pread)
                 return _EINVAL;
-            nread = in->ops->pread(in, buf, chunk, offset);
+            nread = cancellable_fd_pread(in, buf, chunk, offset);
         } else {
             if (in->ops->read) {
-                nread = in->ops->read(in, buf, chunk);
+                nread = cancellable_fd_read(in, buf, chunk);
             } else {
-                nread = in->ops->pread(in, buf, chunk, in->offset);
+                nread = cancellable_fd_pread(in, buf, chunk, in->offset);
                 if (nread > 0)
                     in->offset += nread;
             }
@@ -1496,7 +1594,7 @@ dword_t sys_sendfile64(fd_t out_fd, fd_t in_fd, addr_t offset_addr, dword_t coun
         if (nread == 0)
             break;
 
-        ssize_t nwritten = out->ops->write(out, buf, nread);
+        ssize_t nwritten = cancellable_fd_write(out, buf, nread);
         if (nwritten < 0)
             return total > 0 ? (dword_t) total : (dword_t) nwritten;
 
@@ -1551,16 +1649,16 @@ dword_t sys_copy_file_range(fd_t in_fd, addr_t in_off_addr, fd_t out_fd,
         ssize_t nread;
         if (in_off >= 0) {
             if (in->ops->pread) {
-                do { nread = in->ops->pread(in, buf, chunk, in_off); } while (nread == _EINTR);
+                do { nread = cancellable_fd_pread(in, buf, chunk, in_off); } while (nread == _EINTR);
             } else {
-                do { nread = in->ops->read(in, buf, chunk); } while (nread == _EINTR);
+                do { nread = cancellable_fd_read(in, buf, chunk); } while (nread == _EINTR);
             }
             if (nread > 0) in_off += nread;
         } else {
             if (in->ops->read) {
-                do { nread = in->ops->read(in, buf, chunk); } while (nread == _EINTR);
+                do { nread = cancellable_fd_read(in, buf, chunk); } while (nread == _EINTR);
             } else {
-                do { nread = in->ops->pread(in, buf, chunk, in->offset); } while (nread == _EINTR);
+                do { nread = cancellable_fd_pread(in, buf, chunk, in->offset); } while (nread == _EINTR);
                 if (nread > 0) in->offset += nread;
             }
         }
@@ -1572,16 +1670,16 @@ dword_t sys_copy_file_range(fd_t in_fd, addr_t in_off_addr, fd_t out_fd,
         ssize_t nwritten;
         if (out_off >= 0) {
             if (out->ops->pwrite) {
-                do { nwritten = out->ops->pwrite(out, buf, nread, out_off); } while (nwritten == _EINTR);
+                do { nwritten = cancellable_fd_pwrite(out, buf, nread, out_off); } while (nwritten == _EINTR);
             } else {
-                do { nwritten = out->ops->write(out, buf, nread); } while (nwritten == _EINTR);
+                do { nwritten = cancellable_fd_write(out, buf, nread); } while (nwritten == _EINTR);
             }
             if (nwritten > 0) out_off += nwritten;
         } else {
             if (out->ops->write) {
-                do { nwritten = out->ops->write(out, buf, nread); } while (nwritten == _EINTR);
+                do { nwritten = cancellable_fd_write(out, buf, nread); } while (nwritten == _EINTR);
             } else {
-                do { nwritten = out->ops->pwrite(out, buf, nread, out->offset); } while (nwritten == _EINTR);
+                do { nwritten = cancellable_fd_pwrite(out, buf, nread, out->offset); } while (nwritten == _EINTR);
                 if (nwritten > 0) out->offset += nwritten;
             }
         }

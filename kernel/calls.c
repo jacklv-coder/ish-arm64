@@ -1017,8 +1017,16 @@ void handle_interrupt(int interrupt) {
     receive_signals();
     struct tgroup *group = current->group;
     lock(&group->lock);
-    while (group->stopped)
-        wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
+    while (group->stopped) {
+        int wait_err = wait_for_ignore_signals(&group->stopped_cond,
+                &group->lock, NULL);
+        if (wait_err == _EINTR &&
+                atomic_load(&current->exit_state) ==
+                        TASK_EXIT_FORCE_DETACHED) {
+            unlock(&group->lock);
+            task_finish_force_detached_exit();
+        }
+    }
     unlock(&group->lock);
 }
 
@@ -1166,9 +1174,12 @@ static inline int fast_read(struct cpu_state *cpu) {
     // Direct host read (with EINTR retry)
     char buf[4096];
     ssize_t res;
+    int cancel_state;
+    task_cancellable_host_io_begin(&cancel_state);
     do {
         res = read(fd->real_fd, buf, size);
     } while (res < 0 && errno == EINTR);
+    task_cancellable_host_io_end(cancel_state);
 
     if (res < 0)
         return errno_map();
@@ -1201,9 +1212,12 @@ static inline int fast_write(struct cpu_state *cpu) {
 
     // Direct host write (with EINTR retry)
     ssize_t res;
+    int cancel_state;
+    task_cancellable_host_io_begin(&cancel_state);
     do {
         res = write(fd->real_fd, buf, size);
     } while (res < 0 && errno == EINTR);
+    task_cancellable_host_io_end(cancel_state);
 
     if (res < 0)
         return errno_map();

@@ -150,6 +150,10 @@ struct tty {
 
 // if blocking, may return _EINTR, otherwise, may return _EAGAIN
 ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking);
+// Native-output forwarding must never block while pthread cancellation is
+// disabled. This preserves tty output processing while making backpressure a
+// retryable condition at a lock-free cancellation checkpoint.
+ssize_t tty_write_nonblocking(struct fd *fd, const void *buf, size_t bufsize);
 void tty_set_winsize(struct tty *tty, struct winsize_ winsize);
 void tty_hangup(struct tty *tty);
 

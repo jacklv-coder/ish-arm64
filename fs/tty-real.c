@@ -119,10 +119,24 @@ notty:
     return 0;
 }
 
-static int real_tty_write(struct tty *tty, const void *buf, size_t len, bool UNUSED(blocking)) {
+static int real_tty_write(struct tty *tty, const void *buf, size_t len,
+        bool blocking) {
     if (tty->num != REAL_TTY_NUM)
         return len;
-    return write(STDOUT_FILENO, buf, len);
+
+    if (blocking)
+        return write(STDOUT_FILENO, buf, len);
+
+    // The real terminal cannot be switched to O_NONBLOCK without changing
+    // the process-wide stdout file description. Instead make this lock-free
+    // host write a deferred-cancellation boundary. tty_write_with_blocking
+    // owns any output-transform buffer with a cleanup handler while this call
+    // is cancellable.
+    int previous_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &previous_state);
+    int result = write(STDOUT_FILENO, buf, len);
+    pthread_setcancelstate(previous_state, NULL);
+    return result;
 }
 
 void real_tty_reset_term() {

@@ -34,7 +34,7 @@ int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
         return _EINTR;
     int err = wait_for_ignore_signals(cond, lock, timeout);
     if (err < 0)
-        return _ETIMEDOUT;
+        return err;
     if (is_signal_pending(lock))
         return _EINTR;
     return 0;
@@ -52,7 +52,32 @@ int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout
     struct lock_debug lock_tmp = lock->debug;
     lock->debug = (struct lock_debug) { .initialized = lock->debug.initialized };
 #endif
-    if (!timeout) {
+    if (!timeout && current) {
+        // Lifecycle wakeups deliberately do not take the waiter's associated
+        // mutex. If force-detach publishes between registering waiting_cond
+        // and entering pthread_cond_wait, that broadcast can be missed. Keep
+        // guest waits internally bounded so the published exit state is still
+        // observed without changing the caller-visible indefinite-wait API.
+        const struct timespec poll = {.tv_nsec = 100 * 1000000L};
+        do {
+#if __APPLE__
+            rc = pthread_cond_timedwait_relative_np(&cond->cond, &lock->m,
+                    &poll);
+#elif __linux__
+            struct timespec abs_timeout;
+            clock_gettime(CLOCK_MONOTONIC, &abs_timeout);
+            abs_timeout.tv_nsec += poll.tv_nsec;
+            if (abs_timeout.tv_nsec >= 1000000000) {
+                abs_timeout.tv_sec++;
+                abs_timeout.tv_nsec -= 1000000000;
+            }
+            rc = pthread_cond_timedwait(&cond->cond, &lock->m, &abs_timeout);
+#else
+#error Unimplemented pthread_cond_wait relative timeout.
+#endif
+        } while (rc == ETIMEDOUT &&
+                !atomic_load(&current->force_detached));
+    } else if (!timeout) {
         pthread_cond_wait(&cond->cond, &lock->m);
     } else {
 #if __linux__
@@ -81,6 +106,8 @@ int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout
         current->waiting_lock = NULL;
         unlock(&current->waiting_cond_lock);
     }
+    if (current && atomic_load(&current->force_detached))
+        return _EINTR;
     if (rc == ETIMEDOUT)
         return _ETIMEDOUT;
     return 0;

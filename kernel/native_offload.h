@@ -2,6 +2,7 @@
 #define NATIVE_OFFLOAD_H
 
 #include <stdbool.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <signal.h>
 struct task;
@@ -82,5 +83,26 @@ int native_offload_exec(const char *native_path,
 // Forward a signal to the native process backing a proxy task.
 // Returns true if the signal was forwarded.
 bool native_offload_forward_signal(struct task *task, int sig);
+
+// Waits for a published native child and retires its PID without exposing a
+// post-reap PID-reuse window to cross-thread signal forwarding.
+int native_offload_wait_and_retire(struct task *task, pid_t native_pid,
+                                   int *status);
+
+// Cancels output forwarding workers published by a native proxy. Group exit
+// uses this to release a guest blocked joining a backpressured worker.
+void native_offload_cancel_output_threads(struct task *task);
+
+// Publishes stdout/stderr forwarding workers before running or waiting for a
+// native handler. Publication closes the race where group exit arrives while
+// a handler is already backpressured but the guest task has not joined yet.
+void native_offload_publish_output_threads(pthread_t stdout_thread,
+                                           pthread_t stderr_thread);
+
+// Joins previously published stdout/stderr forwarding workers and clears the
+// handles. This helper never exits the guest task: callers must first finish
+// handler-owned cleanup, then complete a pending force-detached exit.
+void native_offload_join_output_threads(pthread_t stdout_thread,
+                                        pthread_t stderr_thread);
 
 #endif

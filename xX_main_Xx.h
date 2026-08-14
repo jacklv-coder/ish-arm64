@@ -92,7 +92,7 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
         return err;
 
     become_first_process();
-    current->thread = pthread_self();
+    task_adopt_current_thread(current);
 
     // Create essential device nodes (only works with fakefs)
     if (fs != &realfs) {

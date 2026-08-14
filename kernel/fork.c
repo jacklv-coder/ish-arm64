@@ -221,9 +221,22 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
 
     if (flags & CLONE_VFORK_) {
         lock(&vfork.lock);
-        while (!vfork.done)
+        while (!vfork.done) {
             // FIXME this should stop waiting if a fatal signal is received
-            wait_for_ignore_signals(&vfork.cond, &vfork.lock, NULL);
+            int wait_err = wait_for_ignore_signals(&vfork.cond,
+                    &vfork.lock, NULL);
+            if (wait_err == _EINTR &&
+                    atomic_load(&current->exit_state) ==
+                            TASK_EXIT_FORCE_DETACHED) {
+                // The child normally clears task->vfork before waking us.
+                // A forced parent exit must perform the inverse handoff so
+                // the child cannot later dereference this stack object.
+                unlock(&vfork.lock);
+                vfork_abandon(pid, &vfork);
+                cond_destroy(&vfork.cond);
+                task_finish_force_detached_exit();
+            }
+        }
         unlock(&vfork.lock);
         cond_destroy(&vfork.cond);
     }
@@ -253,4 +266,19 @@ void vfork_notify(struct task *task) {
         unlock(&vfork->lock);
     }
     unlock(&task->general_lock);
+}
+
+void vfork_abandon(pid_t child_pid, struct vfork_info *vfork) {
+    // Resolve the child again under pids_lock: task_start() transfers its
+    // lifetime to the child pthread, so the pointer originally returned by
+    // task_create_ is no longer safe for the parent to retain.
+    lock(&pids_lock);
+    struct task *child = pid_get_task_zombie(child_pid);
+    if (child != NULL) {
+        lock(&child->general_lock);
+        if (child->vfork == vfork)
+            child->vfork = NULL;
+        unlock(&child->general_lock);
+    }
+    unlock(&pids_lock);
 }

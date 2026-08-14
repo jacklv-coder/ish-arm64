@@ -427,8 +427,14 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
         if (res == sizeof(struct fd *)) {
             // Wait for acknowledgement that it happened.
             lock(&peer_lock);
-            while (sock->socket.unix_peer == NULL)
-                wait_for_ignore_signals(&sock->socket.unix_got_peer, &peer_lock, NULL);
+            while (sock->socket.unix_peer == NULL) {
+                int wait_err = wait_for_ignore_signals(
+                        &sock->socket.unix_got_peer, &peer_lock, NULL);
+                if (wait_err < 0) {
+                    unlock(&peer_lock);
+                    return wait_err;
+                }
+            }
             unlock(&peer_lock);
         }
     }
@@ -727,6 +733,8 @@ static int sock_wait_for(int real_fd, short events, int timeout_opt) {
         if (pr > 0)
             return 0;
         if (pr == 0) {
+            if (atomic_load(&current->force_detached))
+                return _EINTR;
             continue;
         }
         if (saved_errno == EINTR)

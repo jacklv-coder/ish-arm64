@@ -19,6 +19,10 @@ struct task {
     struct mm *mm; // locked by general_lock
     struct mem *mem; // pointer to mm.mem, for convenience; locked by general_lock
     pthread_t thread;
+    // Published by the creator after pthread_create returns. task_create_
+    // copies its parent, so this flag also prevents lifecycle code from using
+    // a copied pthread_t before the child host handle is available.
+    atomic_bool thread_started;
     uint64_t threadid;
 
     struct tgroup *group; // immutable
@@ -95,6 +99,9 @@ struct task {
     // TASK_EXIT_FORCE_DETACHED. They keep an in-flight syscall's borrowed fd
     // alive even if another CLONE_FILES owner closes the shared table slot.
     struct fdtable_force_detach *force_detached_files;
+    // True only while deferred pthread cancellation is enabled around a host
+    // I/O cancellation point with no iSH lock held.
+    atomic_bool cancellable_host_io;
 
     // this structure is allocated on the stack of the parent's clone() call
     struct vfork_info {
@@ -112,8 +119,11 @@ struct task {
 
     // Native offload: when is_native_proxy is true, this task is waiting
     // for a host-native process instead of running emulated code.
+    lock_t native_lock;
     pid_t native_pid;
     bool is_native_proxy;
+    pthread_t native_stdout_thread;
+    pthread_t native_stderr_thread;
 
     // current condition/lock, so it can be notified in case of a signal
     cond_t *waiting_cond;
@@ -150,12 +160,22 @@ void task_dispose_locked(struct task *task);
 bool task_force_detach_for_group_exit_locked(struct task *task);
 // Releases a force-detached task after its host pthread returns.
 noreturn void task_finish_force_detached_exit(void);
+// Performs the returning half of force-detached cleanup. This is shared with
+// the pthread cancellation handler so a task blocked in a cancellable host I/O
+// operation reaches the same ownership boundary as a normally returning task.
+void task_cleanup_force_detached_exit(void);
+void task_cancelled_exit_cleanup(void *task);
+// Guest pthreads keep deferred cancellation disabled except while executing a
+// known-safe blocking host I/O operation with no iSH locks held.
+void task_cancellable_host_io_begin(int *previous_state);
+void task_cancellable_host_io_end(int previous_state);
 // Clears exit-only state after tgroup_copy duplicates the remaining group
 // configuration. Exposed so the copy contract can be unit-tested.
 void tgroup_reset_exit_state_after_copy(struct tgroup *group);
 
 // misc
 void vfork_notify(struct task *task);
+void vfork_abandon(pid_t child_pid, struct vfork_info *vfork);
 pid_t_ task_setsid(struct task *task);
 void task_leave_session(struct task *task);
 
@@ -255,6 +275,9 @@ void task_start(struct task *task);
 // status. Embedders use this for PID 1 so the owning host can prove the
 // kernel thread has stopped before releasing embedding state.
 int task_start_joinable(struct task *task);
+// Publish a guest task that runs directly on the caller's host pthread.
+// The standalone CLI uses this for PID 1 instead of calling task_start().
+void task_adopt_current_thread(struct task *task);
 void task_run_current(void);
 
 extern void (*exit_hook)(struct task *task, int code);
