@@ -16,6 +16,10 @@
 #include "fs/tty.h"
 
 static void halt_system(void);
+static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out,
+        struct rusage_ *rusage_out, int options);
+static struct list deferred_reap_groups =
+        LIST_INITIALIZER(deferred_reap_groups);
 
 // Must be called with group->lock held. Unpublishing the pointer before the
 // potentially blocking destroy prevents setitimer/alarm from acquiring the
@@ -40,6 +44,7 @@ static void finish_deferred_tgroup_reap_locked(struct tgroup *group) {
         return;
 
     struct task *leader = group->leader;
+    list_remove_safe(&group->deferred_reap);
     cond_destroy(&group->child_exit);
     cond_destroy(&group->stopped_cond);
     task_dispose_locked(leader);
@@ -55,6 +60,11 @@ __attribute__((weak)) void restore_termios(void) {}
 // exits. Embedders override this hook so halt_system can unwind only the
 // joinable kernel pthread instead of terminating the containing app.
 __attribute__((weak)) int ish_embed_soft_halt_enabled(void) { return 0; }
+
+// Embedders may use this non-blocking notification to return their public
+// shutdown call with a timeout while retaining the still-owned runtime state.
+// PID 1 keeps retrying the drain and must not unmount until it is quiescent.
+__attribute__((weak)) void ish_embed_halt_wait_timed_out(void) {}
 
 static bool exit_tgroup(struct task *task) {
     struct tgroup *group = task->group;
@@ -182,6 +192,74 @@ bool task_force_detach_for_group_exit_locked(struct task *task) {
     release_tgroup_exit_timer(timer);
     lock(&task->group->lock);
     return true;
+}
+
+int task_force_detach_all_for_halt_locked(void) {
+    int detached = 0;
+    for (int i = 1; i <= MAX_PID; i++) {
+        struct task *task = pid_get_task(i);
+        if (task == NULL || task == current)
+            continue;
+        // task_create_ publishes initialized storage before copy_task has
+        // acquired its resource references. The creator will either destroy
+        // this task or publish thread_started after ownership is complete;
+        // never tear down the borrowed parent state in between.
+        if (!atomic_load(&task->thread_started))
+            continue;
+
+        lock(&task->group->lock);
+        if (task_force_detach_for_group_exit_locked(task))
+            detached++;
+        unlock(&task->group->lock);
+    }
+    return detached;
+}
+
+int task_reap_halt_children_locked(void) {
+    int remaining = 0;
+    for (int i = 1; i <= MAX_PID; i++) {
+        struct task *task = pid_get_task_zombie(i);
+        if (task == NULL || task == current)
+            continue;
+
+        struct tgroup *group = task->group;
+        lock(&group->lock);
+        bool group_quiescent = group->force_detached_count == 0 &&
+                list_empty(&group->threads);
+        unlock(&group->lock);
+
+        if (group_quiescent && task_is_leader(task) &&
+                (task->zombie || atomic_load(&task->exit_state) ==
+                        TASK_EXIT_FORCE_DETACHED)) {
+            // A force-detached leader cannot run do_exit() to publish its own
+            // zombie record. Embedded PID 1 is the final reaper, so publish it
+            // only after the host pthread has released every group resource.
+            task->zombie = true;
+            struct siginfo_ info = {};
+            struct rusage_ rusage = {};
+            if (reap_if_zombie(task, &info, &rusage, 0))
+                continue;
+        }
+        remaining++;
+    }
+
+    // reap_if_zombie deliberately removes a force-detached leader from the
+    // PID table before its last host pthread exits. Keep those retained groups
+    // in a separate list so embedded shutdown cannot mistake invisibility for
+    // quiescence and tear down global runtime state underneath them.
+    struct tgroup *group, *tmp;
+    list_for_each_entry_safe(&deferred_reap_groups, group, tmp,
+            deferred_reap) {
+        lock(&group->lock);
+        bool group_quiescent = group->force_detached_count == 0 &&
+                list_empty(&group->threads);
+        unlock(&group->lock);
+        if (group_quiescent)
+            finish_deferred_tgroup_reap_locked(group);
+        else
+            remaining++;
+    }
+    return remaining;
 }
 
 static void task_clear_child_tid(struct task *task) {
@@ -599,13 +677,16 @@ noreturn void do_exit_group(int status) {
 
 // always called from init process
 static void halt_system(void) {
+    bool embedded = ish_embed_soft_halt_enabled();
     int max_iterations = 10; // Timeout: wait maximum 10 seconds
     for (int state = 0; state < 3; state++) {
         int tasks_found = 0;
-        for (int i = 2; i < MAX_PID; i++) {
+        for (int i = 2; i <= MAX_PID; i++) {
             struct task *task = pid_get_task(i);
             if (task != NULL) {
                 tasks_found++;
+                if (!atomic_load(&task->thread_started))
+                    continue;
                 switch (state) {
                 case 0:
                     deliver_signal(task, SIGTERM_, SIGINFO_NIL);
@@ -635,6 +716,54 @@ static void halt_system(void) {
         }
     }
 
+    if (embedded) {
+        // halt_system is entered with pids_lock held. A force-detached host
+        // pthread needs that same lock to release its fd table, address space,
+        // signal state and task group, so let it cross the cleanup boundary
+        // before unmounting or returning to the embedding host. If truly
+        // uninterruptible host I/O never returns, the public shutdown deadline
+        // expires while the instance remains intact instead of freeing runtime
+        // state beneath a live task.
+        int detached = 0;
+        bool timeout_reported = false;
+        struct timespec started;
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        while (true) {
+            detached += task_force_detach_all_for_halt_locked();
+            if (task_reap_halt_children_locked() == 0)
+                break;
+            unlock(&pids_lock);
+
+            if (!timeout_reported) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                time_t seconds = now.tv_sec - started.tv_sec;
+                long nanoseconds = now.tv_nsec - started.tv_nsec;
+                if (nanoseconds < 0) {
+                    seconds--;
+                    nanoseconds += 1000000000L;
+                }
+                if (seconds >= 10) {
+                    timeout_reported = true;
+                    ish_embed_halt_wait_timed_out();
+                }
+            }
+
+            // Before the deadline, retry quickly so ordinary cleanup adds
+            // negligible shutdown latency. After reporting a timeout, remain
+            // fail-closed but poll slowly: the host API can return while the
+            // preserved instance eventually becomes safe to join and retry.
+            struct timespec delay = {
+                .tv_nsec = (timeout_reported ? 100 : 10) * 1000000L,
+            };
+            nanosleep(&delay, NULL);
+            lock(&pids_lock);
+        }
+        if (detached > 0 && ish_exec_trace())
+            printk("halt_system: force-detached %d stuck host threads\n",
+                    detached);
+    }
+
     // unmount all filesystems
     lock(&mounts_lock);
     struct mount *mount, *tmp;
@@ -653,7 +782,7 @@ static void halt_system(void) {
     // Standalone iSH owns the entire host process. Embedded iSH instead
     // returns to do_exit(), which invokes exit_hook and exits only the
     // joinable PID 1 pthread; the embedding host then joins that thread.
-    if (!ish_embed_soft_halt_enabled())
+    if (!embedded)
         _exit(0);
 }
 
@@ -717,6 +846,7 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
     list_remove(&group->pgroup);
     if (group->force_detached_count != 0 || !list_empty(&group->threads)) {
         group->reap_deferred = true;
+        list_init_add(&deferred_reap_groups, &group->deferred_reap);
         task_unpublish_locked(task);
     } else {
         cond_destroy(&group->child_exit);
