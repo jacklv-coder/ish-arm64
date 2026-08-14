@@ -1,14 +1,18 @@
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "kernel/calls.h"
 #include "kernel/mm.h"
+#include "kernel/native_offload.h"
 #include "kernel/task.h"
 #include "fs/real.h"
 #include "fs/sock.h"
@@ -62,6 +66,39 @@ struct task_disposer {
 struct detached_task_finisher {
     struct task *task;
     atomic_bool started;
+};
+
+enum blocked_realfs_operation {
+    BLOCKED_REALFS_READ,
+    BLOCKED_REALFS_SENDFILE,
+    BLOCKED_REALFS_COPY_FILE_RANGE,
+};
+
+struct blocked_realfs_io {
+    struct task *task;
+    int ready_pipe[2];
+    enum blocked_realfs_operation operation;
+};
+
+struct blocked_native_wait {
+    struct task *task;
+    pid_t native_pid;
+    int ready_pipe[2];
+    atomic_int status;
+};
+
+struct blocked_native_output_join {
+    struct task *task;
+    int backpressure_pipe[2];
+    atomic_bool forwarder_cancelled;
+};
+
+struct blocked_condition_wait {
+    struct task *task;
+    lock_t lock;
+    cond_t cond;
+    bool signal_aware;
+    atomic_int result;
 };
 
 struct vfork_observer {
@@ -145,6 +182,97 @@ static void *finish_detached_guest_exit_observed(void *opaque) {
     struct detached_task_finisher *finisher = opaque;
     current = finisher->task;
     atomic_store(&finisher->started, true);
+    task_finish_force_detached_exit();
+}
+
+static void *blocked_guest_realfs_read(void *opaque) {
+    struct blocked_realfs_io *blocked = opaque;
+    current = blocked->task;
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_push(task_cancelled_exit_cleanup, blocked->task);
+
+    assert(write(blocked->ready_pipe[1], "r", 1) == 1);
+    // This host pipe deliberately has a live writer and no data. The read must
+    // remain blocked after another thread closes its descriptor, then unwind
+    // through the production syscall cleanup stack and the force-detached task
+    // cleanup handler.
+    switch (blocked->operation) {
+        case BLOCKED_REALFS_READ:
+            (void) sys_read(0, PAGE_SIZE, 1);
+            break;
+        case BLOCKED_REALFS_SENDFILE:
+            (void) sys_sendfile64(1, 0, 0, 1);
+            break;
+        case BLOCKED_REALFS_COPY_FILE_RANGE:
+            (void) sys_copy_file_range(0, 0, 1, 0, 1, 0);
+            break;
+    }
+
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+
+static void *blocked_guest_native_wait(void *opaque) {
+    struct blocked_native_wait *blocked = opaque;
+    current = blocked->task;
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_push(task_cancelled_exit_cleanup, blocked->task);
+
+    assert(write(blocked->ready_pipe[1], "n", 1) == 1);
+    int status = 0;
+    assert(native_offload_wait_and_retire(blocked->task,
+            blocked->native_pid, &status) == 0);
+    atomic_store(&blocked->status, status);
+    task_finish_force_detached_exit();
+
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+
+static void record_output_forwarder_cancel(void *opaque) {
+    struct blocked_native_output_join *blocked = opaque;
+    atomic_store(&blocked->forwarder_cancelled, true);
+}
+
+static void *blocked_native_output_forwarder(void *opaque) {
+    struct blocked_native_output_join *blocked = opaque;
+    pthread_cleanup_push(record_output_forwarder_cancel, blocked);
+    const char value = 'o';
+    (void) write(blocked->backpressure_pipe[1], &value, 1);
+    pthread_cleanup_pop(1);
+    return NULL;
+}
+
+static void *blocked_guest_native_output_join(void *opaque) {
+    struct blocked_native_output_join *blocked = opaque;
+    current = blocked->task;
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_push(task_cancelled_exit_cleanup, blocked->task);
+
+    pthread_t forwarder;
+    assert(pthread_create(&forwarder, NULL,
+            blocked_native_output_forwarder, blocked) == 0);
+    native_offload_publish_output_threads(forwarder, 0);
+    native_offload_join_output_threads(forwarder, 0);
+    task_finish_force_detached_exit();
+
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+
+static void *blocked_guest_condition_wait(void *opaque) {
+    struct blocked_condition_wait *blocked = opaque;
+    current = blocked->task;
+    atomic_store(&blocked->task->thread_started, true);
+    lock(&blocked->lock);
+    int result = blocked->signal_aware
+            ? wait_for(&blocked->cond, &blocked->lock, NULL)
+            : wait_for_ignore_signals(&blocked->cond, &blocked->lock, NULL);
+    atomic_store(&blocked->result, result);
+    unlock(&blocked->lock);
     task_finish_force_detached_exit();
 }
 
@@ -934,6 +1062,301 @@ static void test_force_detach_shuts_down_private_socket(void) {
     free(group);
 }
 
+static void test_force_detach_cancels_blocked_realfs_io(void) {
+    // Exercise both the realfs table and a copied table matching fakefs's
+    // production construction. Both route to the same blocking host callbacks.
+    for (int copied_ops = 0; copied_ops <= 1; copied_ops++) {
+    for (enum blocked_realfs_operation operation = BLOCKED_REALFS_READ;
+            operation <= BLOCKED_REALFS_COPY_FILE_RANGE; operation++) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+    task->files = fdtable_new(2);
+    assert(!IS_ERR(task->files));
+    task_set_mm(task, make_mapped_mm());
+
+    int data_pipe[2];
+    assert(pipe(data_pipe) == 0);
+    struct fd_ops fakefs_like_ops = realfs_fdops;
+    const struct fd_ops *host_ops = copied_ops ? &fakefs_like_ops : &realfs_fdops;
+    struct fd *read_fd = fd_create(host_ops);
+    assert(read_fd != NULL);
+    read_fd->real_fd = data_pipe[0];
+    task->files->files[0] = read_fd;
+    struct fd *write_fd = fd_create(host_ops);
+    assert(write_fd != NULL);
+    write_fd->real_fd = open("/dev/null", O_WRONLY);
+    assert(write_fd->real_fd >= 0);
+    task->files->files[1] = write_fd;
+
+    struct blocked_realfs_io blocked = {
+        .task = task,
+        .operation = operation,
+    };
+    assert(pipe(blocked.ready_pipe) == 0);
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL,
+            blocked_guest_realfs_read, &blocked) == 0);
+    task->thread = worker;
+    atomic_store(&task->thread_started, true);
+    char ready;
+    assert(read(blocked.ready_pipe[0], &ready, 1) == 1);
+    struct timespec settle = {.tv_nsec = 10 * 1000000L};
+    nanosleep(&settle, NULL);
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    assert(atomic_load(&read_fd->real_fd) == -1);
+    assert(atomic_load(&write_fd->real_fd) == -1);
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    void *worker_result = NULL;
+    assert(pthread_join(worker, &worker_result) == 0);
+    assert(worker_result == PTHREAD_CANCELED);
+    assert(group->force_detached_count == 0);
+
+    close(data_pipe[1]);
+    close(blocked.ready_pipe[0]);
+    close(blocked.ready_pipe[1]);
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+    }
+    }
+}
+
+#if __APPLE__
+static void test_force_detach_terminates_native_offload_wait(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+
+    pid_t native_pid = fork();
+    assert(native_pid >= 0);
+    if (native_pid == 0) {
+        for (;;)
+            pause();
+    }
+    lock(&task->native_lock);
+    task->native_pid = native_pid;
+    task->is_native_proxy = true;
+    unlock(&task->native_lock);
+
+    struct blocked_native_wait blocked = {
+        .task = task,
+        .native_pid = native_pid,
+    };
+    atomic_init(&blocked.status, 0);
+    assert(pipe(blocked.ready_pipe) == 0);
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL,
+            blocked_guest_native_wait, &blocked) == 0);
+    task->thread = worker;
+    atomic_store(&task->thread_started, true);
+    char ready;
+    assert(read(blocked.ready_pipe[0], &ready, 1) == 1);
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    assert(pthread_join(worker, NULL) == 0);
+    int status = atomic_load(&blocked.status);
+    assert(WIFSIGNALED(status));
+    assert(WTERMSIG(status) == SIGKILL);
+    assert(group->force_detached_count == 0);
+
+    close(blocked.ready_pipe[0]);
+    close(blocked.ready_pipe[1]);
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+#endif
+
+static void test_force_detach_cancels_native_output_join(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+
+    struct blocked_native_output_join blocked = {.task = task};
+    atomic_init(&blocked.forwarder_cancelled, false);
+    assert(pipe(blocked.backpressure_pipe) == 0);
+    int flags = fcntl(blocked.backpressure_pipe[1], F_GETFL, 0);
+    assert(flags >= 0);
+    assert(fcntl(blocked.backpressure_pipe[1], F_SETFL,
+            flags | O_NONBLOCK) == 0);
+    char fill[4096] = {0};
+    while (write(blocked.backpressure_pipe[1], fill, sizeof(fill)) > 0) {}
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+    assert(fcntl(blocked.backpressure_pipe[1], F_SETFL, flags) == 0);
+
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL,
+            blocked_guest_native_output_join, &blocked) == 0);
+    task->thread = worker;
+    atomic_store(&task->thread_started, true);
+    for (;;) {
+        lock(&task->native_lock);
+        bool published = task->native_stdout_thread != 0;
+        unlock(&task->native_lock);
+        if (published)
+            break;
+        sched_yield();
+    }
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    void *worker_result = NULL;
+    assert(pthread_join(worker, &worker_result) == 0);
+    assert(worker_result == NULL);
+    assert(atomic_load(&blocked.forwarder_cancelled));
+    assert(group->force_detached_count == 0);
+
+    close(blocked.backpressure_pipe[0]);
+    close(blocked.backpressure_pipe[1]);
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
+static void test_task_create_resets_host_thread_state(void) {
+    struct task *parent = task_create_(NULL);
+    assert(parent != NULL);
+    parent->thread = pthread_self();
+    atomic_store(&parent->thread_started, true);
+    atomic_store(&parent->cancellable_host_io, true);
+
+    struct task *child = task_create_(parent);
+    assert(child != NULL);
+    assert(!atomic_load(&child->thread_started));
+    assert(!atomic_load(&child->cancellable_host_io));
+
+    lock(&pids_lock);
+    task_destroy(child);
+    task_destroy(parent);
+    unlock(&pids_lock);
+    current = NULL;
+}
+
+static void test_task_adopt_current_thread_publishes_handle(void) {
+    struct task *task = task_create_(NULL);
+    assert(task != NULL);
+    current = task;
+
+    task_adopt_current_thread(task);
+    assert(atomic_load(&task->thread_started));
+    assert(pthread_equal(task->thread, pthread_self()));
+
+    // Restore the test runner's original default before destroying the task.
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    lock(&pids_lock);
+    task_destroy(task);
+    unlock(&pids_lock);
+    current = NULL;
+}
+
+static void test_force_detach_wakes_condition_wait(void) {
+    for (int signal_aware = 0; signal_aware <= 1; signal_aware++) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+    task->sighand = sighand_new();
+    assert(task->sighand != NULL);
+
+    struct blocked_condition_wait blocked = {
+        .task = task,
+        .signal_aware = signal_aware,
+    };
+    atomic_init(&blocked.result, 0);
+    lock_init(&blocked.lock);
+    cond_init(&blocked.cond);
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL,
+            blocked_guest_condition_wait, &blocked) == 0);
+    task->thread = worker;
+
+    for (;;) {
+        lock(&task->waiting_cond_lock);
+        bool registered = task->waiting_cond == &blocked.cond;
+        unlock(&task->waiting_cond_lock);
+        if (registered)
+            break;
+        sched_yield();
+    }
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    assert(pthread_join(worker, NULL) == 0);
+    assert(atomic_load(&blocked.result) == _EINTR);
+    assert(group->force_detached_count == 0);
+    cond_destroy(&blocked.cond);
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+    }
+}
+
 static void test_force_detach_treats_late_installed_fd_as_live(void) {
     struct task *leader = task_create_(NULL);
     assert(leader != NULL);
@@ -1367,6 +1790,65 @@ static void test_force_detached_cleanup_uses_global_lock_order(void) {
     free(group);
 }
 
+static void test_cancel_cleanup_ignores_unowned_task(void) {
+    struct task *task = task_create_(NULL);
+    assert(task != NULL);
+    atomic_store(&task->cancellable_host_io, true);
+
+    // pthread_exit runs registered handlers after the normal detached-exit
+    // path has cleared current and may already have disposed this task. The
+    // handler must reject the stale capture before touching task storage.
+    current = NULL;
+    task_cancelled_exit_cleanup(task);
+    assert(atomic_load(&task->cancellable_host_io));
+
+    lock(&pids_lock);
+    task_destroy(task);
+    unlock(&pids_lock);
+}
+
+static void test_native_output_join_defers_task_exit(void) {
+    struct task *task = task_create_(NULL);
+    assert(task != NULL);
+    current = task;
+
+    atomic_store(&task->exit_state, TASK_EXIT_FORCE_DETACHED);
+    native_offload_publish_output_threads(0, 0);
+    native_offload_join_output_threads(0, 0);
+
+    // Joining output workers must return to its caller so an in-process
+    // handler can restore cwd and release retained descriptors and argv before
+    // the caller enters task_finish_force_detached_exit().
+    assert(current == task);
+
+    atomic_store(&task->exit_state, TASK_EXIT_RUNNING);
+    current = NULL;
+    lock(&pids_lock);
+    task_destroy(task);
+    unlock(&pids_lock);
+}
+
+static void test_vfork_abandon_clears_stack_handoff(void) {
+    struct task *child = task_create_(NULL);
+    assert(child != NULL);
+
+    struct vfork_info vfork = {};
+    lock_init(&vfork.lock);
+    cond_init(&vfork.cond);
+    child->vfork = &vfork;
+    pid_t child_pid = child->pid;
+
+    vfork_abandon(child_pid, &vfork);
+    assert(child->vfork == NULL);
+
+    // A later child exit must not touch the abandoned parent-stack object.
+    vfork_notify(child);
+    lock(&pids_lock);
+    task_destroy(child);
+    unlock(&pids_lock);
+    cond_destroy(&vfork.cond);
+}
+
 int main(void) {
     test_timer_create_failure_does_not_leave_running_state();
     test_force_detach_snapshot_oom_pins_and_wakes_shared_close();
@@ -1378,6 +1860,16 @@ int main(void) {
     test_force_detach_preserves_externally_shared_fdtable();
     test_force_detach_preserves_fd_shared_by_copied_table();
     test_force_detach_shuts_down_private_socket();
+    test_force_detach_cancels_blocked_realfs_io();
+#if __APPLE__
+    // Host-process native offload is an Apple-only implementation. Other
+    // hosts intentionally expose _ENOSYS stubs and must not exercise it.
+    test_force_detach_terminates_native_offload_wait();
+#endif
+    test_force_detach_cancels_native_output_join();
+    test_task_create_resets_host_thread_state();
+    test_task_adopt_current_thread_publishes_handle();
+    test_force_detach_wakes_condition_wait();
     test_force_detach_treats_late_installed_fd_as_live();
     test_force_detach_consumes_marker_on_inflight_close();
     test_force_detach_shuts_down_duplicated_private_socket();
@@ -1388,5 +1880,8 @@ int main(void) {
     test_group_exit_rejects_replacement_itimer();
     test_dispose_waits_for_pinned_ptrace_user();
     test_force_detached_cleanup_uses_global_lock_order();
+    test_cancel_cleanup_ignores_unowned_task();
+    test_native_output_join_defers_task_exit();
+    test_vfork_abandon_clears_stack_handoff();
     return 0;
 }

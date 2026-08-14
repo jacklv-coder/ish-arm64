@@ -318,6 +318,13 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
             saved_errno = errno;  // save immediately before anything clobbers it
         } while (saved_errno == EINTR && sockrestart_should_restart_listen_wait());
         current->blocking = false;
+        if (atomic_load(&current->force_detached)) {
+            lock(&poll_->lock);
+            list_for_each_entry(&poll_->poll_fds, poll_fd, fds)
+                sockrestart_end_listen_wait(poll_fd->fd);
+            res = _EINTR;
+            break;
+        }
         // Only update last_unblocked_ns when actual events were received.
         // Timeout returns (err==0) don't count as real progress — the poll_wait
         // loop is just cycling. This prevents the deadlock detector from being

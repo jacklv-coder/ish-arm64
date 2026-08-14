@@ -71,7 +71,8 @@ static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ 
         return;
 
     if (task != current) {
-        pthread_kill(task->thread, SIGUSR1);
+        if (atomic_load(&task->thread_started))
+            pthread_kill(task->thread, SIGUSR1);
 
         // wake up any pthread condition waiters
         // actual madness, I hope to god it's correct
@@ -625,7 +626,14 @@ void signal_delivery_stop(int sig, struct siginfo_ *info) {
     unlock(&current->sighand->lock);
     lock(&current->ptrace.lock);
     while (current->ptrace.stopped) {
-        wait_for_ignore_signals(&current->ptrace.cond, &current->ptrace.lock, NULL);
+        int wait_err = wait_for_ignore_signals(&current->ptrace.cond,
+                &current->ptrace.lock, NULL);
+        if (wait_err == _EINTR &&
+                atomic_load(&current->exit_state) ==
+                        TASK_EXIT_FORCE_DETACHED) {
+            unlock(&current->ptrace.lock);
+            task_finish_force_detached_exit();
+        }
         lock(&current->sighand->lock);
         bool got_sigkill = sigset_has(current->pending, SIGKILL_);
         unlock(&current->sighand->lock);

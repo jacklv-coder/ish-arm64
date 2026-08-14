@@ -116,7 +116,8 @@ thank_u_next:
     struct task *task;
     list_for_each_entry(&listen_tasks, task, sockrestart.listen) {
         task->sockrestart.punt = true;
-        pthread_kill(task->thread, SIGUSR1);
+        if (atomic_load(&task->thread_started))
+            pthread_kill(task->thread, SIGUSR1);
     }
     unlock(&sockrestart_lock);
 }

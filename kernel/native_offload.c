@@ -33,6 +33,9 @@
 #include "kernel/native_offload.h"
 #include "kernel/fs.h"
 #include "fs/fd.h"
+#include "fs/real.h"
+#include "fs/sock.h"
+#include "fs/tty.h"
 #include "fs/fake-db.h"
 #ifdef ISH_INTERNAL
 #include "fs/fake.h"
@@ -41,6 +44,65 @@
 #include "fs/fake.h"
 #undef ISH_INTERNAL
 #endif
+
+// Output-worker publication is shared by the Apple implementation and the
+// non-Apple stubs below. Keep these lifecycle helpers outside the platform
+// split so every build that links exit.c has matching definitions.
+static void clear_output_thread_locked(pthread_t *published,
+        pthread_t joined) {
+    if (*published && pthread_equal(*published, joined))
+        *published = 0;
+}
+
+void native_offload_cancel_output_threads(struct task *task) {
+    lock(&task->native_lock);
+    if (task->native_stdout_thread)
+        pthread_cancel(task->native_stdout_thread);
+    if (task->native_stderr_thread)
+        pthread_cancel(task->native_stderr_thread);
+    unlock(&task->native_lock);
+}
+
+void native_offload_publish_output_threads(pthread_t stdout_tid,
+        pthread_t stderr_tid) {
+    struct task *task = current;
+    assert(task != NULL);
+
+    // Publish both workers before the handler can fill either pipe. Group exit
+    // can then cancel a backpressured worker, and publication closes the
+    // inverse race by observing a force detach that arrived before the handles
+    // existed.
+    lock(&task->native_lock);
+    task->native_stdout_thread = stdout_tid;
+    task->native_stderr_thread = stderr_tid;
+    bool force_detached = atomic_load(&task->force_detached);
+    if (force_detached) {
+        if (stdout_tid)
+            pthread_cancel(stdout_tid);
+        if (stderr_tid)
+            pthread_cancel(stderr_tid);
+    }
+    unlock(&task->native_lock);
+}
+
+void native_offload_join_output_threads(pthread_t stdout_tid,
+        pthread_t stderr_tid) {
+    struct task *task = current;
+    assert(task != NULL);
+
+    if (stdout_tid) {
+        pthread_join(stdout_tid, NULL);
+        lock(&task->native_lock);
+        clear_output_thread_locked(&task->native_stdout_thread, stdout_tid);
+        unlock(&task->native_lock);
+    }
+    if (stderr_tid) {
+        pthread_join(stderr_tid, NULL);
+        lock(&task->native_lock);
+        clear_output_thread_locked(&task->native_stderr_thread, stderr_tid);
+        unlock(&task->native_lock);
+    }
+}
 
 #if !__APPLE__
 int native_offload_add(const char *spec) { (void)spec; return -1; }
@@ -52,6 +114,11 @@ int native_offload_exec(const char *native_path, const char *guest_file,
 }
 bool native_offload_forward_signal(struct task *task, int sig) {
     (void)task; (void)sig; return false;
+}
+int native_offload_wait_and_retire(struct task *task, pid_t native_pid,
+        int *status) {
+    (void) task; (void) native_pid; (void) status;
+    return _ENOSYS;
 }
 #else
 
@@ -298,12 +365,46 @@ static int guest_to_host_signal(int guest_sig) {
 }
 
 bool native_offload_forward_signal(struct task *task, int sig) {
-    if (!task->is_native_proxy || task->native_pid <= 0)
-        return false;
+    lock(&task->native_lock);
+    pid_t native_pid = task->is_native_proxy ? task->native_pid : 0;
     int host_sig = guest_to_host_signal(sig);
-    if (host_sig > 0)
-        kill(task->native_pid, host_sig);
-    return true;
+    bool forwarded = native_pid > 0 && host_sig > 0;
+    if (forwarded)
+        kill(native_pid, host_sig);
+    unlock(&task->native_lock);
+    return forwarded;
+}
+
+int native_offload_wait_and_retire(struct task *task, pid_t native_pid,
+        int *status) {
+    for (;;) {
+        // Reaping and clearing the published PID must be one native_lock
+        // transaction. A zombie PID cannot be reused before waitpid(), and the
+        // lock prevents another thread from forwarding a signal after waitpid
+        // has made that PID reusable but before the proxy state is retired.
+        lock(&task->native_lock);
+        pid_t ret = waitpid(native_pid, status, WNOHANG);
+        if (ret == native_pid) {
+            task->is_native_proxy = false;
+            task->native_pid = 0;
+            unlock(&task->native_lock);
+            return 0;
+        }
+        if (ret < 0 && errno != EINTR) {
+            int saved_errno = errno;
+            task->is_native_proxy = false;
+            task->native_pid = 0;
+            unlock(&task->native_lock);
+            errno = saved_errno;
+            return errno_map();
+        }
+        unlock(&task->native_lock);
+
+        // Keep native_lock available to signal/group-exit while the child is
+        // alive. Short polling avoids a blocking waitpid under that lock.
+        const struct timespec delay = {.tv_nsec = 1000000L};
+        nanosleep(&delay, NULL);
+    }
 }
 
 // --- Post-exec: scan for new files and register in fakefs DB ---
@@ -454,11 +555,84 @@ struct pipe_fwd {
     struct fd *guest_fd; // guest fd (iOS handler path), NULL if using dest_fd
 };
 
+static void pipe_forward_cleanup(void *opaque) {
+    struct pipe_fwd *fwd = opaque;
+    close(fwd->pipe_rd);
+    if (fwd->guest_fd)
+        fd_close(fwd->guest_fd);
+    free(fwd);
+}
+
+// Output workers use deferred cancellation only at points where they hold no
+// iSH lock. In particular, cancelling pthread_cond_wait inside tty_input would
+// reacquire the tty mutex before cleanup and make fd_close self-deadlock.
+static void pipe_forward_cancel_checkpoint(bool wait_before_retry) {
+    int previous_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &previous_state);
+    if (wait_before_retry) {
+        const struct timespec retry_delay = {.tv_nsec = 10 * 1000 * 1000L};
+        nanosleep(&retry_delay, NULL);
+    } else {
+        pthread_testcancel();
+    }
+    pthread_setcancelstate(previous_state, NULL);
+}
+
+static ssize_t pipe_forward_read(int fd, void *buf, size_t size) {
+    int previous_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &previous_state);
+    ssize_t result = read(fd, buf, size);
+    pthread_setcancelstate(previous_state, NULL);
+    return result;
+}
+
+static ssize_t pipe_forward_host_write(int fd, const void *buf, size_t size) {
+    int previous_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &previous_state);
+    ssize_t result = write(fd, buf, size);
+    pthread_setcancelstate(previous_state, NULL);
+    return result;
+}
+
+static ssize_t pipe_forward_guest_write(struct fd *fd, const void *buf,
+        size_t size) {
+    if (fd->ops == &tty_dev.fd)
+        return tty_write_nonblocking(fd, buf, size);
+
+    // realfs performs a single lock-free host write, so cancellation is safe.
+    if (fd->ops->write == realfs_write) {
+        int previous_state;
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &previous_state);
+        ssize_t result = fd->ops->write(fd, buf, size);
+        pthread_setcancelstate(previous_state, NULL);
+        return result;
+    }
+
+    // Avoid entering the socket implementation with no guest-task TLS. A
+    // nonblocking host send has the required forwarding semantics and returns
+    // to the cancellation checkpoint when the socket is backpressured.
+    if (fd->ops == &socket_fdops) {
+        ssize_t result = send(fd->real_fd, buf, size, MSG_DONTWAIT
+#ifdef MSG_NOSIGNAL
+                | MSG_NOSIGNAL
+#endif
+        );
+        return result < 0 ? errno_map() : result;
+    }
+
+    // In-memory and device fd implementations complete synchronously. Keep
+    // cancellation disabled across their internal lock scope.
+    return fd->ops->write(fd, buf, size);
+}
+
 static void *pipe_forward_thread(void *arg) {
     struct pipe_fwd *fwd = arg;
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_push(pipe_forward_cleanup, fwd);
     char buf[4096];
     ssize_t n;
-    while ((n = read(fwd->pipe_rd, buf, sizeof(buf))) > 0) {
+    while ((n = pipe_forward_read(fwd->pipe_rd, buf, sizeof(buf))) > 0) {
         // Replace \r not followed by \n with \n (progress bar lines)
         for (ssize_t i = 0; i < n; i++) {
             if (buf[i] == '\r') {
@@ -471,16 +645,23 @@ static void *pipe_forward_thread(void *arg) {
             // iOS path: write through guest fd ops (TTY driver → Terminal UI)
             ssize_t written = 0;
             while (written < n) {
-                ssize_t w = fwd->guest_fd->ops->write(fwd->guest_fd,
-                                                       buf + written, n - written);
-                if (w <= 0) break;
+                ssize_t w = pipe_forward_guest_write(fwd->guest_fd,
+                        buf + written, n - written);
+                if (w == _EAGAIN) {
+                    pipe_forward_cancel_checkpoint(true);
+                    continue;
+                }
+                if (w <= 0)
+                    break;
                 written += w;
+                pipe_forward_cancel_checkpoint(false);
             }
         } else {
             // macOS path: write to host real_fd
             ssize_t written = 0;
             while (written < n) {
-                ssize_t w = write(fwd->dest_fd, buf + written, n - written);
+                ssize_t w = pipe_forward_host_write(fwd->dest_fd,
+                        buf + written, n - written);
                 if (w < 0) {
                     if (errno == EINTR) continue;
                     break;
@@ -489,10 +670,7 @@ static void *pipe_forward_thread(void *arg) {
             }
         }
     }
-    close(fwd->pipe_rd);
-    if (fwd->guest_fd)
-        fd_close(fwd->guest_fd);
-    free(fwd);
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -615,6 +793,8 @@ static int exec_handler(native_handler_func handler, const char *guest_file,
     if (stderr_pipe[0] >= 0 && guest_stderr)
         stderr_tid = start_pipe_forward_guest(stderr_pipe[0], guest_stderr);
 
+    native_offload_publish_output_threads(stdout_tid, stderr_tid);
+
     // Resolve host paths for handler: it may need to read/write files
     // in the fakefs data directory. Set cwd to host CWD.
     char *host_cwd = get_host_cwd();
@@ -632,8 +812,7 @@ static int exec_handler(native_handler_func handler, const char *guest_file,
     // Close write ends so forwarding threads see EOF
     if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
     if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
-    if (stdout_tid) pthread_join(stdout_tid, NULL);
-    if (stderr_tid) pthread_join(stderr_tid, NULL);
+    native_offload_join_output_threads(stdout_tid, stderr_tid);
 
     // Restore cwd
     if (cwd_changed)
@@ -645,6 +824,12 @@ static int exec_handler(native_handler_func handler, const char *guest_file,
     if (guest_stderr) fd_close(guest_stderr);
 
     native_free_string_array(handler_argv);
+
+    // A forced exit may cancel the forwarding workers to release handler
+    // output backpressure. Complete every handler-owned cleanup step before
+    // leaving the guest task through the common detached-exit boundary.
+    if (atomic_load(&current->exit_state) == TASK_EXIT_FORCE_DETACHED)
+        task_finish_force_detached_exit();
 
     int exit_code = ret << 8;
     printk("native_offload: [builtin] %s exited with code %d\n", guest_file, ret);
@@ -730,6 +915,20 @@ static int exec_posix_spawn(const char *native_path, const char *guest_file,
     int spawn_err = posix_spawn(&native_pid, native_path, &actions, &attrs,
                                 native_argv, native_envp);
 
+    // Publish the proxy immediately after the child exists. Group exit can
+    // otherwise force-detach this task during the setup below without knowing
+    // which host process must be terminated to unblock waitpid.
+    if (spawn_err == 0) {
+        lock(&current->native_lock);
+        current->native_pid = native_pid;
+        current->is_native_proxy = true;
+        // Close the post-spawn publication race: a concurrent force-detach may
+        // have observed the old proxy state immediately before these stores.
+        if (atomic_load(&current->exit_state) == TASK_EXIT_FORCE_DETACHED)
+            kill(native_pid, SIGKILL);
+        unlock(&current->native_lock);
+    }
+
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attrs);
     native_free_string_array(native_argv);
@@ -752,29 +951,25 @@ static int exec_posix_spawn(const char *native_path, const char *guest_file,
     if (stderr_pipe[0] >= 0)
         stderr_tid = start_pipe_forward(stderr_pipe[0], stderr_dest);
 
+    native_offload_publish_output_threads(stdout_tid, stderr_tid);
+
     printk("native_offload: spawned host pid %d for guest pid %d\n",
            native_pid, current->pid);
 
-    current->native_pid = native_pid;
-    current->is_native_proxy = true;
-
     apply_exec_semantics(guest_file);
 
-    // Wait for native process
+    // Wait for the native process. Reap and publication retirement are
+    // serialized with cross-thread signal forwarding inside the helper.
     int status;
-    while (true) {
-        pid_t ret = waitpid(native_pid, &status, 0);
-        if (ret == native_pid) break;
-        if (ret < 0 && errno == EINTR) continue;
-        if (ret < 0) {
-            printk("native_offload: waitpid failed: %s\n", strerror(errno));
-            status = 1 << 8;
-            break;
-        }
+    if (native_offload_wait_and_retire(current, native_pid, &status) < 0) {
+        printk("native_offload: waitpid failed: %s\n", strerror(errno));
+        status = 1 << 8;
     }
 
-    if (stdout_tid) pthread_join(stdout_tid, NULL);
-    if (stderr_tid) pthread_join(stderr_tid, NULL);
+    native_offload_join_output_threads(stdout_tid, stderr_tid);
+
+    if (atomic_load(&current->exit_state) == TASK_EXIT_FORCE_DETACHED)
+        task_finish_force_detached_exit();
 
     int exit_code;
     if (WIFEXITED(status)) {
@@ -790,8 +985,6 @@ static int exec_posix_spawn(const char *native_path, const char *guest_file,
     }
 
     register_new_files(argc, argv);
-    current->is_native_proxy = false;
-    current->native_pid = 0;
     do_exit(exit_code);
     __builtin_unreachable();
 }

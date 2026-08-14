@@ -181,6 +181,9 @@ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
             // ret == 0 (timeout) or ret < 0 (EINTR from signal) — check conditions
 
             stall_count++;
+            if (atomic_load(&current->force_detached)) {
+                err = _EINTR; break;
+            }
             if (current->group->doing_group_exit) {
                 err = _EINTR; break;
             }

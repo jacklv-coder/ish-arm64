@@ -10,6 +10,7 @@
 #include "kernel/calls.h"
 #include "kernel/mm.h"
 #include "kernel/futex.h"
+#include "kernel/native_offload.h"
 #include "kernel/ptrace.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
@@ -116,12 +117,51 @@ bool task_force_detach_for_group_exit_locked(struct task *task) {
     if (task->files != NULL) {
         lock(&task->files->lock);
         files_snapshot = fdtable_prepare_force_detach_locked(task->files);
-        fdtable_commit_force_detach_locked(task->files, files_snapshot);
     }
     task->force_detached_files = files_snapshot;
     atomic_store(&task->force_detached, true);
-    if (task->files != NULL)
+    // Publish the cleanup contract before closing any host descriptor. A
+    // native-offload proxy is blocked in waitpid rather than a guest fd, so
+    // terminate its host child explicitly; waitpid can then reap it and reach
+    // the normal force-detached cleanup boundary. On
+    // Darwin a cross-thread close may make read return immediately; queuing
+    // deferred cancellation first ensures that either the blocked cancellation
+    // point or the next cancellation-state transition runs the task cleanup.
+    // The cleanup handler cannot pass pids_lock until this function has
+    // finished publishing every resource and group-state change below.
+    native_offload_forward_signal(task, SIGKILL_);
+    native_offload_cancel_output_threads(task);
+    if (atomic_load(&task->thread_started)) {
+        // The creator publishes thread_started after pthread_create returns,
+        // before the JIT initializes poked_ptr. Condvar/futex wakeups below
+        // cover that short startup window; signal the thread only after the
+        // CPU backend is ready and the runtime signal handler is installed.
+        if (task->cpu.poked_ptr != NULL) {
+            cpu_poke(&task->cpu);
+            pthread_kill(task->thread, SIGUSR1);
+        }
+    }
+    // Re-publish the existing signal wake after force_detached becomes
+    // visible. Condvar-backed syscalls can then return to handle_interrupt,
+    // whose first action is the force-detached cleanup checkpoint.
+    lock(&task->waiting_cond_lock);
+    if (task->waiting_cond != NULL)
+        notify(task->waiting_cond);
+    unlock(&task->waiting_cond_lock);
+    if (task->futex_pipe[1] != -1) {
+        char wake = 1;
+        (void) write(task->futex_pipe[1], &wake, 1);
+    }
+    // Never queue cancellation for an arbitrary guest location. It is safe
+    // only when the target has explicitly published that it is inside one of
+    // the lock-free host I/O wrappers.
+    if (atomic_load(&task->thread_started) &&
+            atomic_load(&task->cancellable_host_io))
+        pthread_cancel(task->thread);
+    if (task->files != NULL) {
+        fdtable_commit_force_detach_locked(task->files, files_snapshot);
         unlock(&task->files->lock);
+    }
     task->exiting = true;
 
     list_remove(&task->group_links);
@@ -201,7 +241,7 @@ static void task_release_runtime_resources(struct task *task) {
     }
 }
 
-noreturn void task_finish_force_detached_exit(void) {
+void task_cleanup_force_detached_exit(void) {
     struct task *task = current;
     int exit_state = task == NULL ? TASK_EXIT_RUNNING :
             atomic_load(&task->exit_state);
@@ -259,6 +299,10 @@ noreturn void task_finish_force_detached_exit(void) {
 
     finish_deferred_tgroup_reap_locked(group);
     unlock(&pids_lock);
+}
+
+noreturn void task_finish_force_detached_exit(void) {
+    task_cleanup_force_detached_exit();
     pthread_exit(NULL);
 }
 
@@ -431,7 +475,8 @@ noreturn void do_exit_group(int status) {
     struct task *task;
     list_for_each_entry(&group->threads, task, group_links) {
         thread_count++;
-        deliver_signal(task, SIGKILL_, SIGINFO_NIL);
+        if (!native_offload_forward_signal(task, SIGKILL_))
+            deliver_signal(task, SIGKILL_, SIGINFO_NIL);
         task->group->stopped = false;
         notify(&task->group->stopped_cond);
     }
@@ -479,16 +524,9 @@ noreturn void do_exit_group(int status) {
         }
 
         if (waited_ms >= max_wait_ms) {
-            // Threads are stuck in blocking syscalls and won't exit.
-            // Try SIGUSR1 first (interrupts blocking syscalls without
-            // corrupting heap state). If after 3 rounds the thread is
-            // still alive — most likely because the host application
-            // re-enters the same syscall on EINTR (libuv worker pool
-            // does this for epoll_wait) — escalate to SIGTERM. SIGTERM
-            // is unmasked-by-default but doesn't have a libuv handler
-            // installed, so the host kernel kills the thread cleanly.
-            // Don't use pthread_cancel — it can corrupt malloc state if
-            // the thread is cancelled inside malloc/free.
+            // Threads are stuck in blocking syscalls and won't exit. First
+            // interrupt ordinary guest waits so they can observe SIGKILL at a
+            // normal syscall boundary.
             if (ish_exec_trace())
                 printk("SAFETY-VALVE[exit]: pid=%d do_exit_group waited %dms, %d threads still stuck → force kill\n",
                        current->pid, waited_ms, last_remaining);
@@ -500,7 +538,7 @@ noreturn void do_exit_group(int status) {
                     if (task != current && !task->exiting) {
                         still_alive++;
                         cpu_poke(&task->cpu);
-                        if (task->thread)
+                        if (atomic_load(&task->thread_started))
                             pthread_kill(task->thread, SIGUSR1);
                     }
                 }
@@ -510,47 +548,27 @@ noreturn void do_exit_group(int status) {
                 struct timespec ts2 = {0, 50 * 1000000L};  // 50ms
                 nanosleep(&ts2, NULL);
             }
-            // Escalation round: SIGTERM. node libuv re-arms epoll_wait
-            // on SIGUSR1 (it uses USR1 itself for its debug interface)
-            // but has no SIGTERM handler in worker threads, so the host
-            // pthread terminates and the wait4 in the parent unblocks.
-            for (int attempt = 0; attempt < 2; attempt++) {
-                lock(&pids_lock);
-                lock(&group->lock);
-                int still_alive = 0;
-                list_for_each_entry(&group->threads, task, group_links) {
-                    if (task != current && !task->exiting) {
-                        still_alive++;
-                        if (task->thread)
-                            pthread_kill(task->thread, SIGTERM);
-                    }
-                }
-                unlock(&group->lock);
-                unlock(&pids_lock);
-                if (still_alive == 0) break;
-                struct timespec ts3 = {0, 100 * 1000000L};  // 100ms
-                nanosleep(&ts3, NULL);
-            }
-
-            // If threads are truly stuck in uninterruptible host syscalls,
-            // we accept the leak rather than risking heap corruption.
-            // Mark them as exiting and remove from the thread group list so
-            // that exit_tgroup() sees the group as dead and notifies the parent.
+            // Escalate without sending a process-directed signal. Claim each
+            // remaining task's resources first, then request deferred pthread
+            // cancellation. Guest pthreads enable cancellation only around
+            // selected blocking host I/O calls where no iSH lock is held, and
+            // their outer cleanup handler completes force-detached teardown.
             lock(&pids_lock);
             lock(&group->lock);
-            int leaked = 0;
+            int detached = 0;
             struct task *task_tmp;
             list_for_each_entry_safe(&group->threads, task, task_tmp, group_links) {
                 if (task != current && !task->exiting) {
-                    if (task_force_detach_for_group_exit_locked(task))
-                        leaked++;
+                    if (task_force_detach_for_group_exit_locked(task)) {
+                        detached++;
+                    }
                 }
             }
             unlock(&group->lock);
             unlock(&pids_lock);
-            if (leaked > 0 && ish_exec_trace())
-                printk("SAFETY-VALVE[exit]: pid=%d leaked %d stuck host threads\n",
-                       current->pid, leaked);
+            if (detached > 0 && ish_exec_trace())
+                printk("SAFETY-VALVE[exit]: pid=%d cancelled %d stuck host threads\n",
+                       current->pid, detached);
         } else {
 
             // Give extra time for pthread cleanup on host system
@@ -596,7 +614,12 @@ static void halt_system(void) {
                     deliver_signal(task, SIGKILL_, SIGINFO_NIL);
                     break;
                 case 2:
-                    pthread_kill(task->thread, SIGTERM);
+                    // Never use a process-directed host signal as a pthread
+                    // termination mechanism. In embedded mode that would kill
+                    // the containing iOS App; standalone mode reaches _exit
+                    // below after the guest shutdown attempts complete.
+                    native_offload_forward_signal(task, SIGKILL_);
+                    deliver_signal(task, SIGKILL_, SIGINFO_NIL);
                 }
             }
         }

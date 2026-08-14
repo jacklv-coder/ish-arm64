@@ -540,7 +540,8 @@ error:
     return err;
 }
 
-static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
+static ssize_t tty_write_with_blocking(struct fd *fd, const void *buf,
+        size_t bufsize, bool blocking) {
     struct tty *tty = fd->tty;
     lock(&tty->lock);
     if (tty->hung_up || pty_is_half_closed_master(tty)) {
@@ -548,7 +549,6 @@ static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
         return _EIO;
     }
 
-    bool blocking = !(fd->flags & O_NONBLOCK_);
     dword_t oflags = tty->termios.oflags;
     // we have to unlock it now to avoid lock ordering problems with ptys
     // the code below is safe because it only accesses tty->driver which is immutable
@@ -574,12 +574,27 @@ static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
         }
         buf = postbuf;
     }
+    // A nonblocking caller may make a cancellation-safe driver call below.
+    // Keep the transformed buffer owned by this stack frame so deferred
+    // cancellation cannot leak it while unwinding through the driver.
+    pthread_cleanup_push(free, postbuf);
     err = tty->driver->ops->write(tty, buf, postbufsize, blocking);
+    pthread_cleanup_pop(0);
     if (postbuf)
         free(postbuf);
     if (err < 0)
         return err;
     return bufsize;
+}
+
+static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
+    return tty_write_with_blocking(fd, buf, bufsize,
+            !(fd->flags & O_NONBLOCK_));
+}
+
+ssize_t tty_write_nonblocking(struct fd *fd, const void *buf, size_t bufsize) {
+    assert(fd->ops == &tty_dev.fd);
+    return tty_write_with_blocking(fd, buf, bufsize, false);
 }
 
 static int tty_poll(struct fd *fd) {

@@ -95,7 +95,8 @@ void cond_destroy(cond_t *cond);
 // _ETIMEDOUT if waiting stopped because the timout expired, 0 otherwise.
 // Will never return _ETIMEDOUT if timeout is NULL.
 int must_check wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout);
-// Same as wait_for, except it will never return _EINTR
+// Same as wait_for, except guest signals do not interrupt the wait. Lifecycle
+// force-detach still returns _EINTR so the owning host thread can clean up.
 int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout);
 // Wake up all waiters.
 void notify(cond_t *cond);

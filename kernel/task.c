@@ -67,10 +67,18 @@ struct task *task_create_(struct task *parent) {
     // task-local locks. Initialize copied synchronization state before
     // publishing the task through either the PID table or its parent's list.
     lock_init(&task->general_lock);
+    lock_init(&task->native_lock);
     lock_init(&task->ptrace.lock);
     cond_init(&task->ptrace.cond);
     atomic_init(&task->force_detached, false);
     atomic_init(&task->exit_state, TASK_EXIT_RUNNING);
+    atomic_init(&task->thread_started, false);
+    atomic_init(&task->cancellable_host_io, false);
+    task->thread = zero_init(pthread_t);
+    task->native_pid = 0;
+    task->is_native_proxy = false;
+    task->native_stdout_thread = zero_init(pthread_t);
+    task->native_stderr_thread = zero_init(pthread_t);
     task->force_detached_files = NULL;
     pid->task = task;
 
@@ -173,7 +181,46 @@ static void task_run_tlb_cleanup(void *arg) {
     tlb_free((struct tlb *)arg);
 }
 
+void task_cancellable_host_io_begin(int *previous_state) {
+    *previous_state = PTHREAD_CANCEL_DISABLE;
+    if (current != NULL) {
+        atomic_store(&current->cancellable_host_io, true);
+        // Pair the publication above with the force-detach decision. If exit
+        // won the race before cancellation was enabled, stop at this safe
+        // boundary instead of entering a host call that nobody will cancel.
+        if (atomic_load(&current->exit_state) == TASK_EXIT_FORCE_DETACHED) {
+            atomic_store(&current->cancellable_host_io, false);
+            task_finish_force_detached_exit();
+        }
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, previous_state);
+    }
+}
+
+void task_cancellable_host_io_end(int previous_state) {
+    if (current != NULL) {
+        pthread_setcancelstate(previous_state, NULL);
+        atomic_store(&current->cancellable_host_io, false);
+    }
+}
+
+void task_cancelled_exit_cleanup(void *arg) {
+    struct task *task = arg;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    // A normal force-detached exit clears current before disposing the task.
+    // pthread_exit still runs this registered handler, so do not dereference
+    // the captured pointer unless this thread still owns that task.
+    if (current != task)
+        return;
+    atomic_store(&task->cancellable_host_io, false);
+    if (atomic_load(&task->exit_state) == TASK_EXIT_FORCE_DETACHED)
+        task_cleanup_force_detached_exit();
+}
+
 void task_run_current() {
+    struct task *task = current;
+    // Directly adopted threads (the CLI PID 1) need the same cancellation
+    // cleanup boundary as pthreads created by task_start().
+    pthread_cleanup_push(task_cancelled_exit_cleanup, task);
     struct cpu_state *cpu = &current->cpu;
     struct tlb *tlb = calloc(1, sizeof(struct tlb));
     if (!tlb) die("could not allocate TLB");
@@ -214,10 +261,28 @@ void task_run_current() {
     // Never reached in practice (loop only exits via pthread_exit/do_exit),
     // but the pop is required for pthread_cleanup_push/pop balance.
     pthread_cleanup_pop(1);
+    pthread_cleanup_pop(0);
 }
 
 static void *task_thread(void *vtask) {
+    // Cancellation is an emergency wakeup for selected host I/O cancellation
+    // points, never a general asynchronous task-kill mechanism. Keeping it
+    // disabled everywhere else prevents cancellation while malloc or an iSH
+    // lock is active.
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     current = vtask;
+    // pthread_create may schedule this entry point before it has stored the
+    // new pthread_t into the caller-provided task->thread slot. Wait until the
+    // creator publishes that handle before any lifecycle path is allowed to
+    // target it with pthread_kill/pthread_cancel.
+    while (!atomic_load(&current->thread_started))
+        sched_yield();
+    // A group exit can claim a child after it is published but before
+    // pthread_create schedules this entry point. Complete that claim before
+    // touching any copied guest state.
+    if (atomic_load(&current->exit_state) == TASK_EXIT_FORCE_DETACHED)
+        task_finish_force_detached_exit();
     if (unblock_internal_signal() != 0)
         die("could not unblock internal signal for guest task");
     update_thread_name();
@@ -234,10 +299,22 @@ __attribute__((constructor)) static void create_attr() {
 void task_start(struct task *task) {
     if (pthread_create(&task->thread, &task_thread_attr, task_thread, task) != 0)
         die("could not create thread");
+    atomic_store(&task->thread_started, true);
 }
 
 int task_start_joinable(struct task *task) {
-    return pthread_create(&task->thread, NULL, task_thread, task);
+    int err = pthread_create(&task->thread, NULL, task_thread, task);
+    if (err == 0)
+        atomic_store(&task->thread_started, true);
+    return err;
+}
+
+void task_adopt_current_thread(struct task *task) {
+    assert(current == task);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    task->thread = pthread_self();
+    atomic_store(&task->thread_started, true);
 }
 
 int_t sys_sched_yield() {
