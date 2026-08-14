@@ -14,6 +14,7 @@
 #include "kernel/mm.h"
 #include "kernel/native_offload.h"
 #include "kernel/task.h"
+#include "fs/poll.h"
 #include "fs/real.h"
 #include "fs/sock.h"
 
@@ -99,6 +100,13 @@ struct blocked_condition_wait {
     cond_t cond;
     bool signal_aware;
     atomic_int result;
+};
+
+struct blocked_poll_cleanup {
+    struct task *task;
+    struct fd *fd;
+    atomic_int result;
+    atomic_uint refs_after_syscall;
 };
 
 struct vfork_observer {
@@ -273,6 +281,20 @@ static void *blocked_guest_condition_wait(void *opaque) {
             : wait_for_ignore_signals(&blocked->cond, &blocked->lock, NULL);
     atomic_store(&blocked->result, result);
     unlock(&blocked->lock);
+    task_finish_force_detached_exit();
+}
+
+static void *blocked_guest_poll(void *opaque) {
+    struct blocked_poll_cleanup *blocked = opaque;
+    current = blocked->task;
+
+    atomic_store(&blocked->result, sys_poll(PAGE_SIZE,
+            1, -1));
+    // Force-detach snapshots one reference and the descriptor table owns one.
+    // The syscall's temporary poll reference must already be gone before the
+    // outer task-exit boundary releases those final two references.
+    atomic_store(&blocked->refs_after_syscall,
+            atomic_load(&blocked->fd->refcount));
     task_finish_force_detached_exit();
 }
 
@@ -1357,6 +1379,75 @@ static void test_force_detach_wakes_condition_wait(void) {
     }
 }
 
+static void test_force_detached_poll_releases_syscall_resources(void) {
+    struct task *leader = task_create_(NULL);
+    assert(leader != NULL);
+    struct tgroup *group = make_group(leader);
+
+    struct task *task = task_create_(leader);
+    assert(task != NULL);
+    task->group = group;
+    task->tgid = leader->tgid;
+    list_add(&group->threads, &task->group_links);
+    task->sighand = sighand_new();
+    assert(task->sighand != NULL);
+    task->files = fdtable_new(1);
+    assert(!IS_ERR(task->files));
+    task_set_mm(task, make_mapped_mm());
+
+    int data_pipe[2];
+    assert(pipe(data_pipe) == 0);
+    struct fd *poll_fd = fd_create(&realfs_fdops);
+    assert(poll_fd != NULL);
+    poll_fd->real_fd = data_pipe[0];
+    task->files->files[0] = poll_fd;
+
+    struct pollfd_ guest_poll = {
+        .fd = 0,
+        .events = POLL_READ,
+    };
+    assert(user_write_task(task, PAGE_SIZE, &guest_poll,
+            sizeof(guest_poll)) == 0);
+
+    struct blocked_poll_cleanup blocked = {
+        .task = task,
+        .fd = poll_fd,
+    };
+    atomic_init(&blocked.result, 0);
+    atomic_init(&blocked.refs_after_syscall, 0);
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL, blocked_guest_poll, &blocked) == 0);
+    task->thread = worker;
+    atomic_store(&task->thread_started, true);
+
+    // sys_poll retains the descriptor before entering poll_wait. Waiting for
+    // that reference makes the force-detach timing deterministic.
+    while (atomic_load(&poll_fd->refcount) < 2)
+        sched_yield();
+
+    current = leader;
+    lock(&pids_lock);
+    lock(&group->lock);
+    assert(task_force_detach_for_group_exit_locked(task));
+    unlock(&group->lock);
+    unlock(&pids_lock);
+
+    assert(pthread_join(worker, NULL) == 0);
+    assert(atomic_load(&blocked.result) == _EINTR);
+    assert(atomic_load(&blocked.refs_after_syscall) == 2);
+    assert(group->force_detached_count == 0);
+
+    close(data_pipe[1]);
+    list_remove(&leader->group_links);
+    lock(&pids_lock);
+    task_destroy(leader);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+}
+
 static void test_force_detach_treats_late_installed_fd_as_live(void) {
     struct task *leader = task_create_(NULL);
     assert(leader != NULL);
@@ -1870,6 +1961,7 @@ int main(void) {
     test_task_create_resets_host_thread_state();
     test_task_adopt_current_thread_publishes_handle();
     test_force_detach_wakes_condition_wait();
+    test_force_detached_poll_releases_syscall_resources();
     test_force_detach_treats_late_installed_fd_as_live();
     test_force_detach_consumes_marker_on_inflight_close();
     test_force_detach_shuts_down_duplicated_private_socket();
