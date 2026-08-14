@@ -46,8 +46,6 @@
 void tgroup_reset_exit_state_after_copy(struct tgroup *group) {
     group->doing_group_exit = false;
     group->force_detached_count = 0;
-    group->reap_deferred = false;
-    list_init(&group->deferred_reap);
 }
 
 static struct tgroup *tgroup_copy(struct tgroup *old_group) {

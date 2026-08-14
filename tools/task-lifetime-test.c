@@ -18,6 +18,13 @@
 #include "fs/real.h"
 #include "fs/sock.h"
 
+#define TEST_P_PID 1
+#define TEST_WEXITED (1 << 2)
+#define TEST_WNOWAIT (1 << 24)
+
+int do_wait(int idtype, pid_t_ id, struct siginfo_ *info,
+        struct rusage_ *rusage, int options);
+
 static atomic_bool fail_timer_thread_create;
 static atomic_bool fail_fd_snapshot_alloc;
 
@@ -347,7 +354,6 @@ static struct tgroup *make_group(struct task *leader) {
     list_init(&group->threads);
     list_init(&group->session);
     list_init(&group->pgroup);
-    list_init(&group->deferred_reap);
     lock_init(&group->lock);
     cond_init(&group->child_exit);
     cond_init(&group->stopped_cond);
@@ -632,7 +638,7 @@ static void test_embedded_halt_waits_for_unstarted_task(void) {
     free(init_group);
 }
 
-static void test_embedded_halt_tracks_unpublished_deferred_group(void) {
+static void test_embedded_halt_tracks_unreapable_zombie(void) {
     struct task *init = task_create_(NULL);
     assert(init != NULL);
     struct tgroup *init_group = make_group(init);
@@ -657,8 +663,8 @@ static void test_embedded_halt_tracks_unpublished_deferred_group(void) {
     unlock(&pids_lock);
 
     pid_t_ child_pid = child->pid;
-    assert((pid_t_) sys_wait4(child_pid, 0, 0, 0) == child_pid);
-    assert(pid_get_task_zombie(child_pid) == NULL);
+    assert((pid_t_) sys_wait4(child_pid, 0, WNOHANG, 0) == 0);
+    assert(pid_get_task_zombie(child_pid) == child);
     lock(&pids_lock);
     assert(task_reap_halt_children_locked() == 1);
     unlock(&pids_lock);
@@ -732,10 +738,17 @@ static void test_reap_waits_for_force_detached_leader(void) {
     unlock(&pids_lock);
 
     pid_t_ leader_pid = leader->pid;
-    assert((pid_t_) sys_wait4(leader_pid, 0, 0, 0) == leader_pid);
-    assert(group->reap_deferred);
+    // A visible child exit is the embedding supervisor's permission to reuse
+    // the runtime for another process. Keep the zombie pending while a
+    // force-detached host pthread or a late CLONE_THREAD child still owns the
+    // old process group.
+    struct siginfo_ observed = {};
+    assert(do_wait(TEST_P_PID, leader_pid, &observed, NULL,
+            TEST_WEXITED | TEST_WNOWAIT) == 0);
+    assert(observed.child.pid == leader_pid);
+    assert((pid_t_) sys_wait4(leader_pid, 0, WNOHANG, 0) == 0);
     assert(group->force_detached_count == 1);
-    assert(pid_get_task_zombie(leader_pid) == NULL);
+    assert(pid_get_task_zombie(leader_pid) == leader);
 
     blocked_write_release(&write);
     assert(pthread_join(worker, NULL) == 0);
@@ -743,18 +756,20 @@ static void test_reap_waits_for_force_detached_leader(void) {
     assert(atomic_load(&mm->refcount) == 1);
     assert(late_child->parent == NULL);
     assert(list_empty(&leader->children));
-    assert(group->reap_deferred);
     assert(group->force_detached_count == 0);
     assert(!list_empty(&group->threads));
+    assert((pid_t_) sys_wait4(leader_pid, 0, WNOHANG, 0) == 0);
     blocked_write_destroy(&write);
     mm_release(mm);
 
-    // The late CLONE_THREAD child is now the final owner of the retained group.
-    // Its ordinary exit must dispose both itself and the already-reaped leader.
+    // The late CLONE_THREAD child is now the final owner of the group. Its
+    // ordinary exit makes the leader reapable; only then may wait4 publish the
+    // process exit to the supervisor.
     pid_t_ late_child_pid = late_child->pid;
     pthread_t late_worker;
     assert(pthread_create(&late_worker, NULL, normal_guest_exit, late_child) == 0);
     assert(pthread_join(late_worker, NULL) == 0);
+    assert((pid_t_) sys_wait4(leader_pid, 0, 0, 0) == leader_pid);
     assert(pid_get_task_zombie(late_child_pid) == NULL);
     assert(pid_get_task_zombie(leader_pid) == NULL);
 
@@ -1890,12 +1905,10 @@ static void test_copied_group_drops_exit_only_state(void) {
     struct tgroup group = {
         .doing_group_exit = true,
         .force_detached_count = 7,
-        .reap_deferred = true,
     };
     tgroup_reset_exit_state_after_copy(&group);
     assert(!group.doing_group_exit);
     assert(group.force_detached_count == 0);
-    assert(!group.reap_deferred);
 }
 
 static void test_group_exit_rejects_replacement_itimer(void) {
@@ -2075,7 +2088,7 @@ int main(void) {
     test_force_detached_leader_stays_hidden_until_zombie();
     test_embedded_halt_waits_for_force_detached_child();
     test_embedded_halt_waits_for_unstarted_task();
-    test_embedded_halt_tracks_unpublished_deferred_group();
+    test_embedded_halt_tracks_unreapable_zombie();
     test_reap_waits_for_force_detached_leader();
     test_force_detach_during_normal_exit_handoff();
     test_force_detach_preserves_externally_shared_fdtable();
