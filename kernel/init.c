@@ -69,6 +69,7 @@ static struct task *construct_task(struct task *parent) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
     *group = (struct tgroup) {};
     list_init(&group->threads);
+    list_init(&group->deferred_reap);
     lock_init(&group->lock);
     cond_init(&group->child_exit);
     cond_init(&group->stopped_cond);

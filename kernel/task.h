@@ -158,6 +158,12 @@ void task_dispose_locked(struct task *task);
 // Resource ownership is intentionally part of this boundary so the forced
 // group-exit path can be covered by a deterministic host test.
 bool task_force_detach_for_group_exit_locked(struct task *task);
+// Claims every remaining task except current during embedded PID 1 shutdown.
+// Must be called with pids_lock held.
+int task_force_detach_all_for_halt_locked(void);
+// Reaps quiescent shutdown children and returns the number still retaining
+// task-group state. Must be called with pids_lock held.
+int task_reap_halt_children_locked(void);
 // Releases a force-detached task after its host pthread returns.
 noreturn void task_finish_force_detached_exit(void);
 // Performs the returning half of force-detached cleanup. This is shared with
@@ -225,6 +231,9 @@ struct tgroup {
     // force-detached host pthreads have returned.
     unsigned force_detached_count;
     bool reap_deferred;
+    // Keeps a reaped, unpublished leader discoverable until every detached
+    // host pthread has released the remaining group state.
+    struct list deferred_reap;
 
     // Once V8 prints a fatal-abort prefix to stderr (e.g. "abort: " or
     // "# Fatal error"), suppress every subsequent stderr write from the

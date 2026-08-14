@@ -162,6 +162,7 @@ static void blocked_write_release(struct blocked_write *write) {
 static void *blocked_guest_write(void *opaque) {
     struct blocked_write *write = opaque;
     current = write->task;
+    atomic_store(&write->task->thread_started, true);
 
     pthread_mutex_lock(&write->lock);
     write->ready = true;
@@ -346,6 +347,7 @@ static struct tgroup *make_group(struct task *leader) {
     list_init(&group->threads);
     list_init(&group->session);
     list_init(&group->pgroup);
+    list_init(&group->deferred_reap);
     lock_init(&group->lock);
     cond_init(&group->child_exit);
     cond_init(&group->stopped_cond);
@@ -553,6 +555,131 @@ static void test_force_detached_leader_stays_hidden_until_zombie(void) {
     cond_destroy(&parent_group->child_exit);
     cond_destroy(&parent_group->stopped_cond);
     free(parent_group);
+}
+
+static void test_embedded_halt_waits_for_force_detached_child(void) {
+    struct task *init = task_create_(NULL);
+    assert(init != NULL);
+    struct tgroup *init_group = make_group(init);
+
+    struct task *child = task_create_(init);
+    assert(child != NULL);
+    make_group(child);
+    task_set_mm(child, make_mapped_mm());
+    pid_t_ child_pid = child->pid;
+
+    struct blocked_write write;
+    blocked_write_init(&write, child);
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL, blocked_guest_write, &write) == 0);
+    blocked_write_wait_until_ready(&write);
+
+    current = init;
+    lock(&pids_lock);
+    assert(task_force_detach_all_for_halt_locked() == 1);
+    // PID 1 must not return and tear down global runtime state while the
+    // detached host pthread still owns the child's address space.
+    assert(task_reap_halt_children_locked() == 1);
+    assert(pid_get_task_zombie(child_pid) == child);
+    unlock(&pids_lock);
+
+    blocked_write_release(&write);
+    assert(pthread_join(worker, NULL) == 0);
+    assert(atomic_load(&write.result) == 0);
+    blocked_write_destroy(&write);
+
+    lock(&pids_lock);
+    assert(task_reap_halt_children_locked() == 0);
+    assert(pid_get_task_zombie(child_pid) == NULL);
+    unlock(&pids_lock);
+
+    list_remove(&init->group_links);
+    lock(&pids_lock);
+    task_destroy(init);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&init_group->child_exit);
+    cond_destroy(&init_group->stopped_cond);
+    free(init_group);
+}
+
+static void test_embedded_halt_waits_for_unstarted_task(void) {
+    struct task *init = task_create_(NULL);
+    assert(init != NULL);
+    struct tgroup *init_group = make_group(init);
+
+    // Model the window after task_create_ has published initialized storage
+    // but before copy_task has retained resources and started the host thread.
+    struct task *constructing = task_create_(init);
+    assert(constructing != NULL);
+    current = init;
+
+    lock(&pids_lock);
+    assert(task_force_detach_all_for_halt_locked() == 0);
+    assert(atomic_load(&constructing->exit_state) == TASK_EXIT_RUNNING);
+    assert(task_reap_halt_children_locked() == 1);
+    task_destroy(constructing);
+    assert(task_reap_halt_children_locked() == 0);
+    unlock(&pids_lock);
+
+    list_remove(&init->group_links);
+    lock(&pids_lock);
+    task_destroy(init);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&init_group->child_exit);
+    cond_destroy(&init_group->stopped_cond);
+    free(init_group);
+}
+
+static void test_embedded_halt_tracks_unpublished_deferred_group(void) {
+    struct task *init = task_create_(NULL);
+    assert(init != NULL);
+    struct tgroup *init_group = make_group(init);
+
+    struct task *child = task_create_(init);
+    assert(child != NULL);
+    struct tgroup *child_group = make_group(child);
+    task_set_mm(child, make_mapped_mm());
+
+    struct blocked_write write;
+    blocked_write_init(&write, child);
+    pthread_t worker;
+    assert(pthread_create(&worker, NULL, blocked_guest_write, &write) == 0);
+    blocked_write_wait_until_ready(&write);
+
+    current = init;
+    lock(&pids_lock);
+    lock(&child_group->lock);
+    assert(task_force_detach_for_group_exit_locked(child));
+    child->zombie = true;
+    unlock(&child_group->lock);
+    unlock(&pids_lock);
+
+    pid_t_ child_pid = child->pid;
+    assert((pid_t_) sys_wait4(child_pid, 0, 0, 0) == child_pid);
+    assert(pid_get_task_zombie(child_pid) == NULL);
+    lock(&pids_lock);
+    assert(task_reap_halt_children_locked() == 1);
+    unlock(&pids_lock);
+
+    blocked_write_release(&write);
+    assert(pthread_join(worker, NULL) == 0);
+    assert(atomic_load(&write.result) == 0);
+    blocked_write_destroy(&write);
+
+    lock(&pids_lock);
+    assert(task_reap_halt_children_locked() == 0);
+    unlock(&pids_lock);
+
+    list_remove(&init->group_links);
+    lock(&pids_lock);
+    task_destroy(init);
+    unlock(&pids_lock);
+    current = NULL;
+    cond_destroy(&init_group->child_exit);
+    cond_destroy(&init_group->stopped_cond);
+    free(init_group);
 }
 
 static void test_reap_waits_for_force_detached_leader(void) {
@@ -1946,6 +2073,9 @@ int main(void) {
     test_snapshot_after_oom_pins_tombstoned_descriptor();
     test_nonleader_resources_follow_host_pthread();
     test_force_detached_leader_stays_hidden_until_zombie();
+    test_embedded_halt_waits_for_force_detached_child();
+    test_embedded_halt_waits_for_unstarted_task();
+    test_embedded_halt_tracks_unpublished_deferred_group();
     test_reap_waits_for_force_detached_leader();
     test_force_detach_during_normal_exit_handoff();
     test_force_detach_preserves_externally_shared_fdtable();

@@ -18,7 +18,7 @@ static bool pid_empty(struct pid *pid) {
 }
 
 struct pid *pid_get(dword_t id) {
-    if (id > sizeof(pids)/sizeof(pids[0]))
+    if (id >= sizeof(pids)/sizeof(pids[0]))
         return NULL;
     struct pid *pid = &pids[id];
     if (pid_empty(pid))
@@ -80,8 +80,6 @@ struct task *task_create_(struct task *parent) {
     task->native_stdout_thread = zero_init(pthread_t);
     task->native_stderr_thread = zero_init(pthread_t);
     task->force_detached_files = NULL;
-    pid->task = task;
-
 #ifdef GUEST_ARM64
     // Invalidate exclusive monitor after copying parent state.
     // Child must not inherit parent's LDXR reservation, as any context
@@ -98,11 +96,11 @@ struct task *task_create_(struct task *parent) {
     }
     list_init(&task->children);
     list_init(&task->siblings);
+    list_init(&task->group_links);
     if (parent != NULL) {
         task->parent = parent;
         list_add(&parent->children, &task->siblings);
     }
-    unlock(&pids_lock);
 
     task->pending = 0;
     list_init(&task->queue);
@@ -119,6 +117,13 @@ struct task *task_create_(struct task *parent) {
     task->waiting_lock = NULL;
     lock_init(&task->waiting_cond_lock);
     cond_init(&task->pause);
+
+    // Publish only after every field that shutdown, signal delivery and procfs
+    // may inspect has been initialized. Callers still finish clone ownership
+    // before task_start(); embedded halt treats an unstarted task as in-flight
+    // construction and waits for the caller to either start or destroy it.
+    pid->task = task;
+    unlock(&pids_lock);
 
     return task;
 }
