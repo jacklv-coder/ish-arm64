@@ -83,6 +83,9 @@ static dword_t select_common(fd_t nfds, addr_t readfds_addr, addr_t writefds_add
     memset(exceptfds, 0, fdset_size);
     struct select_context context = {readfds, writefds, exceptfds};
     int err = poll_wait(poll, select_event_callback, &context, timeout_addr);
+    // A force-detached task still returns through this wrapper before
+    // handle_interrupt reaches the final task-exit boundary. Keep destruction
+    // here so the temporary host poll object is never abandoned.
     STRACE("%d end %s ", current->pid, name);
     for (fd_t i = 0; i < nfds; i++) {
         if (bit_test(i, readfds) || bit_test(i, writefds) || bit_test(i, exceptfds)) {
@@ -197,6 +200,9 @@ dword_t sys_poll(addr_t fds, dword_t nfds, int_t timeout) {
         timeout_ts.tv_nsec = (timeout % 1000) * 1000000;
     }
     int res = poll_wait(poll, poll_event_callback, &context, timeout < 0 ? NULL : &timeout_ts);
+    // poll_wait reports force-detach as EINTR; the syscall wrapper must first
+    // release its poll object and retained descriptors. handle_interrupt only
+    // finishes the task after this function returns.
     poll_destroy(poll);
     for (unsigned i = 0; i < nfds; i++) {
         if (files[i] != NULL)

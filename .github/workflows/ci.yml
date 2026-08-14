@@ -38,7 +38,7 @@ jobs:
       - name: Test
         if: matrix.kernel == 'ish'
         timeout-minutes: 10
-        run: meson test -C build --no-rebuild --print-errorlogs dirty-page-trace float80 uname internal-signal-mask
+        run: meson test -C build --no-rebuild --print-errorlogs dirty-page-trace float80 uname internal-signal-mask task-lifetime
       - name: End-to-end test
         if: matrix.kernel == 'ish'
         timeout-minutes: 20
