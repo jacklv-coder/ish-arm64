@@ -18,8 +18,6 @@
 static void halt_system(void);
 static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out,
         struct rusage_ *rusage_out, int options);
-static struct list deferred_reap_groups =
-        LIST_INITIALIZER(deferred_reap_groups);
 
 // Must be called with group->lock held. Unpublishing the pointer before the
 // potentially blocking destroy prevents setitimer/alarm from acquiring the
@@ -35,20 +33,23 @@ static void release_tgroup_exit_timer(struct timer *timer) {
         timer_free_sync(timer);
 }
 
-// Must be called with pids_lock held. Reaping can remove the Linux-visible
-// leader before a force-detached host pthread (or a late CLONE_THREAD child)
-// reaches its final exit boundary, so all three conditions are required.
-static void finish_deferred_tgroup_reap_locked(struct tgroup *group) {
-    if (!group->reap_deferred || group->force_detached_count != 0 ||
-            !list_empty(&group->threads))
-        return;
+// pids_lock serializes thread-group membership and force-detached cleanup.
+// A zombie is not safe for an embedding supervisor to consume until no host
+// pthread can still borrow the old process's runtime resources.
+static bool tgroup_reap_ready_locked(struct tgroup *group) {
+    return group->force_detached_count == 0 &&
+            list_empty(&group->threads);
+}
 
+// The leader may have published its zombie before the final detached or late
+// CLONE_THREAD task released the group. Wake a wait4 caller when that last
+// owner disappears so the process exit becomes visible without polling delay.
+static void notify_tgroup_reap_ready_locked(struct tgroup *group) {
     struct task *leader = group->leader;
-    list_remove_safe(&group->deferred_reap);
-    cond_destroy(&group->child_exit);
-    cond_destroy(&group->stopped_cond);
-    task_dispose_locked(leader);
-    free(group);
+    if (!tgroup_reap_ready_locked(group) || !leader->zombie ||
+            leader->parent == NULL)
+        return;
+    notify(&leader->parent->group->child_exit);
 }
 
 // Weak default: overridden by main.c in CLI builds.
@@ -243,22 +244,6 @@ int task_reap_halt_children_locked(void) {
         remaining++;
     }
 
-    // reap_if_zombie deliberately removes a force-detached leader from the
-    // PID table before its last host pthread exits. Keep those retained groups
-    // in a separate list so embedded shutdown cannot mistake invisibility for
-    // quiescence and tear down global runtime state underneath them.
-    struct tgroup *group, *tmp;
-    list_for_each_entry_safe(&deferred_reap_groups, group, tmp,
-            deferred_reap) {
-        lock(&group->lock);
-        bool group_quiescent = group->force_detached_count == 0 &&
-                list_empty(&group->threads);
-        unlock(&group->lock);
-        if (group_quiescent)
-            finish_deferred_tgroup_reap_locked(group);
-        else
-            remaining++;
-    }
     return remaining;
 }
 
@@ -350,6 +335,7 @@ void task_cleanup_force_detached_exit(void) {
     struct tgroup *group = task->group;
     assert(group->force_detached_count > 0);
     group->force_detached_count--;
+    notify_tgroup_reap_ready_locked(group);
 
     // Match normal exit ordering: a vfork parent may resume only after
     // CLONE_CHILD_CLEARTID and every shared-address-space cleanup operation is
@@ -375,7 +361,6 @@ void task_cleanup_force_detached_exit(void) {
     if (!task_is_leader(task))
         task_dispose_locked(task);
 
-    finish_deferred_tgroup_reap_locked(group);
     unlock(&pids_lock);
 }
 
@@ -458,8 +443,10 @@ static noreturn void do_exit_claimed(int status) {
     bool group_dead = exit_tgroup(current);
     if (group_dead) {
         // If already marked zombie by do_exit_group force path, skip
-        if (leader->zombie)
+        if (leader->zombie) {
+            notify_tgroup_reap_ready_locked(leader->group);
             goto skip_zombie_notify;
+        }
 
         // notify parent that we died
         struct task *parent = leader->parent;
@@ -500,8 +487,6 @@ static noreturn void do_exit_claimed(int status) {
         current = NULL;  // Clear before destroy to prevent dangling access
         task_destroy(self);
     }
-    if (group_dead)
-        finish_deferred_tgroup_reap_locked(leader->group);
     unlock(&pids_lock);
 
     pthread_exit(NULL);
@@ -813,6 +798,18 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
         return false;
     lock(&task->group->lock);
 
+    // A destructive wait4 is the guest supervisor's authoritative process-exit
+    // boundary. Returning while a force-detached host pthread or late group
+    // member still owns the process lets an embedder start a replacement
+    // process against partially reclaimed global/runtime state. Keep that reap
+    // pending until the complete thread group is quiescent; WNOWAIT remains an
+    // observational query and may inspect the zombie without consuming it.
+    if (!(options & WNOWAIT_) &&
+            !tgroup_reap_ready_locked(task->group)) {
+        unlock(&task->group->lock);
+        return false;
+    }
+
     dword_t exit_code = task->exit_code;
     if (task->group->doing_group_exit)
         exit_code = task->group->group_exit_code;
@@ -838,22 +835,15 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
                current->pid, task->pid, (unsigned)exit_code, task->comm);
     }
 
-    // Remove Linux-visible group state immediately. If a host pthread was
-    // force-detached, retain the synchronization objects, group and leader
-    // storage until that pthread reaches its cleanup boundary.
+    // Reap only after the readiness check above proved that no host pthread or
+    // late group member can still borrow this task group's storage.
     struct tgroup *group = task->group;
     task_leave_session(task);
     list_remove(&group->pgroup);
-    if (group->force_detached_count != 0 || !list_empty(&group->threads)) {
-        group->reap_deferred = true;
-        list_init_add(&deferred_reap_groups, &group->deferred_reap);
-        task_unpublish_locked(task);
-    } else {
-        cond_destroy(&group->child_exit);
-        cond_destroy(&group->stopped_cond);
-        free(group);
-        task_destroy(task);
-    }
+    cond_destroy(&group->child_exit);
+    cond_destroy(&group->stopped_cond);
+    free(group);
+    task_destroy(task);
     return true;
 }
 

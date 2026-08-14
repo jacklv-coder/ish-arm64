@@ -230,10 +230,6 @@ struct tgroup {
     // Protected by pids_lock. Retains the group and leader storage until all
     // force-detached host pthreads have returned.
     unsigned force_detached_count;
-    bool reap_deferred;
-    // Keeps a reaped, unpublished leader discoverable until every detached
-    // host pthread has released the remaining group state.
-    struct list deferred_reap;
 
     // Once V8 prints a fatal-abort prefix to stderr (e.g. "abort: " or
     // "# Fatal error"), suppress every subsequent stderr write from the
