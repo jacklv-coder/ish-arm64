@@ -47,6 +47,10 @@ if get_option('kernel') == 'ish'
     endif
 
     if not meson.is_cross_build() and guest_arch == 'arm64' and host_machine.cpu_family() == 'aarch64'
+        arm64_neon_reverse_test = executable('arm64-neon-reverse-test',
+            ['arm64-neon-reverse-test.c'], dependencies: [ish])
+        test('arm64-neon-reverse', arm64_neon_reverse_test)
+
         dirty_page_chain_test = executable('dirty-page-chain-test',
             ['dirty-page-chain-test.c'], dependencies: [ish])
         test('dirty-page-chain', dirty_page_chain_test)
