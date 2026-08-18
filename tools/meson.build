@@ -16,6 +16,10 @@ if get_option('kernel') == 'ish'
             ['wrlock-writer-preference-test.c'], dependencies: [ish])
         test('wrlock-writer-preference', wrlock_writer_preference_test,
             timeout: 30)
+
+        sockaddr_layout_test = executable('sockaddr-layout-test',
+            ['sockaddr-layout-test.c'], dependencies: [ish])
+        test('sockaddr-layout', sockaddr_layout_test)
     endif
 
     # The differential tracers model the x86 guest CPU state.

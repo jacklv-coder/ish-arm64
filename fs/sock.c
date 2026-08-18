@@ -281,11 +281,10 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
 
     if (user_read(sockaddr_addr, sockaddr, *sockaddr_len))
         return _EFAULT;
-    struct sockaddr *real_addr = sockaddr;
     struct sockaddr_ *fake_addr = sockaddr;
-    real_addr->sa_family = sock_family_to_real(fake_addr->family);
+    int real_family = sock_prepare_real_address(sockaddr, *sockaddr_len);
 
-    switch (real_addr->sa_family) {
+    switch (real_family) {
         case PF_INET:
             if (*sockaddr_len < sizeof(struct sockaddr_in))
                 return _EINVAL;
@@ -329,6 +328,9 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
             if (bind_fd != NULL)
                 unlink(real_addr_un->sun_path);
             *sockaddr_len = offsetof(struct sockaddr_un, sun_path) + path_len;
+#ifdef __APPLE__
+            real_addr_un->sun_len = *sockaddr_len;
+#endif
             break;
         }
         default:
