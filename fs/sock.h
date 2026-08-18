@@ -115,6 +115,23 @@ static inline int sock_family_from_real(int fake) {
     return -1;
 }
 
+// Linux socket addresses begin with a 16-bit family. Darwin splits those two
+// bytes into sa_len followed by sa_family, so translating only the family
+// leaves sa_len equal to the Linux family value (2 for IPv4, 10 for IPv6).
+// Darwin then rejects otherwise valid guest destinations during sendto/connect.
+static inline int sock_prepare_real_address(void *address, socklen_t length) {
+    struct sockaddr_ *fake_address = address;
+    struct sockaddr *real_address = address;
+    int real_family = sock_family_to_real(fake_address->family);
+    if (real_family < 0)
+        return -1;
+#ifdef __APPLE__
+    real_address->sa_len = length;
+#endif
+    real_address->sa_family = real_family;
+    return real_family;
+}
+
 #define SOCK_STREAM_ 1
 #define SOCK_DGRAM_ 2
 #define SOCK_RAW_ 3
